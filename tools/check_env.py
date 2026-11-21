@@ -165,7 +165,7 @@ def check_vlm() -> None:
             endpoint,
             json=payload,
             auth=HTTPBasicAuth(vlm_user, vlm_pass) if vlm_user else None,
-            timeout=60,
+            timeout=180,
         )
         elapsed = time.time() - start
         if resp.status_code == 200:
