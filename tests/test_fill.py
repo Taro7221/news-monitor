@@ -73,8 +73,8 @@ def test_default_label_fn_ambiguous_next_flagged():
 
 def test_build_cell_plan_joins_same_minute_with_slash():
     events = [
-        {"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200},
-        {"kind": "news", "label": "B", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200},
+        {"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 0},
+        {"kind": "news", "label": "B", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 1},
     ]
 
     def label_fn(ev):
@@ -87,8 +87,8 @@ def test_build_cell_plan_joins_same_minute_with_slash():
 
 def test_build_cell_plan_any_low_conf_marks_whole_cell():
     events = [
-        {"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200},
-        {"kind": "news", "label": "B", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200},
+        {"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 0},
+        {"kind": "news", "label": "B", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 1},
     ]
 
     def label_fn(ev):
@@ -100,13 +100,78 @@ def test_build_cell_plan_any_low_conf_marks_whole_cell():
 
 
 def test_build_cell_plan_skips_out_of_range_minute():
-    events = [{"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1300}]
+    events = [{"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1300, "video_second": 0}]
 
     def label_fn(ev):
         return ev["label"], False, ""
 
     plan = fill.build_cell_plan(events, label_fn)
     assert plan == {}
+
+
+def test_consolidate_same_minute_events_merges_near_identical_titles():
+    events = [
+        {"kind": "news", "label": "汽油彈襲警車罪加一等", "confidence": 0.9, "video_second": 300},
+        {"kind": "news", "label": "汽油彈襲警車罪一等", "confidence": 0.5, "video_second": 320},
+    ]
+    result = fill.consolidate_same_minute_events(events)
+    assert len(result) == 1
+    assert result[0]["label"] == "汽油彈襲警車罪加一等"  # 信心度較高的當代表
+
+
+def test_consolidate_same_minute_events_keeps_genuinely_different_apart():
+    events = [
+        {"kind": "news", "label": "持刀警開槍", "confidence": 0.9, "video_second": 300},
+        {"kind": "news", "label": "台股二補跌", "confidence": 0.9, "video_second": 320},
+    ]
+    result = fill.consolidate_same_minute_events(events)
+    assert len(result) == 2
+
+
+def test_consolidate_same_minute_events_ambiguous_uses_vlm_judge():
+    def fake_similarity(a, b):
+        return 70.0  # 介於門檻之間
+
+    events = [
+        {"kind": "news", "label": "標題A", "confidence": 0.9, "video_second": 300},
+        {"kind": "news", "label": "標題B", "confidence": 0.9, "video_second": 320},
+    ]
+    merged = fill.consolidate_same_minute_events(events, vlm_judge_fn=lambda a, b: True, similarity_fn=fake_similarity)
+    assert len(merged) == 1
+    split = fill.consolidate_same_minute_events(events, vlm_judge_fn=lambda a, b: False, similarity_fn=fake_similarity)
+    assert len(split) == 2
+
+
+def test_consolidate_same_minute_events_preserves_chronological_order():
+    events = [
+        {"kind": "news", "label": "乙新聞", "confidence": 0.9, "video_second": 320},
+        {"kind": "news", "label": "甲新聞", "confidence": 0.9, "video_second": 300},
+    ]
+    result = fill.consolidate_same_minute_events(events)
+    assert [e["label"] for e in result] == ["甲新聞", "乙新聞"]
+
+
+def test_build_cell_plan_passes_vlm_judge_fn_to_consolidation(monkeypatch):
+    events = [
+        {"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 0},
+        {"kind": "news", "label": "B", "confidence": 0.5, "ambiguous_next": None, "minute_code": 1200, "video_second": 10},
+    ]
+    captured = {}
+
+    def fake_consolidate(news_events, vlm_judge_fn=None):
+        captured["vlm_judge_fn"] = vlm_judge_fn
+        return news_events[:1]  # 假裝合併成一個，驗證 build_cell_plan 真的會用這個結果
+
+    monkeypatch.setattr(fill, "consolidate_same_minute_events", fake_consolidate)
+
+    def label_fn(ev):
+        return ev["label"], False, ""
+
+    sentinel = lambda a, b: True
+    plan = fill.build_cell_plan(events, label_fn, vlm_judge_fn=sentinel)
+
+    assert captured["vlm_judge_fn"] is sentinel
+    assert plan[5]["text"] == "A"
 
 
 def _make_minimal_template(path: Path):
@@ -127,8 +192,8 @@ def test_fill_workbook_only_touches_target_columns(tmp_path):
     output_path = tmp_path / "out.xlsx"
 
     channels_fill_events = {
-        "ftv": [{"kind": "ad", "label": "廣告", "confidence": 1.0, "ambiguous_next": None, "minute_code": 1200}],
-        "cts": [{"kind": "news", "label": "某則新聞標題", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1201}],
+        "ftv": [{"kind": "ad", "label": "廣告", "confidence": 1.0, "ambiguous_next": None, "minute_code": 1200, "video_second": 0}],
+        "cts": [{"kind": "news", "label": "某則新聞標題", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1201, "video_second": 60}],
     }
     stats = fill.fill_workbook(channels_fill_events, template_path=template_path, output_path=output_path)
 
@@ -148,7 +213,7 @@ def test_fill_workbook_marks_low_confidence_with_fill_and_comment(tmp_path):
     output_path = tmp_path / "out.xlsx"
 
     channels_fill_events = {
-        "ftv": [{"kind": "news", "label": "某則新聞標題", "confidence": 0.1, "ambiguous_next": None, "minute_code": 1200}],
+        "ftv": [{"kind": "news", "label": "某則新聞標題", "confidence": 0.1, "ambiguous_next": None, "minute_code": 1200, "video_second": 0}],
     }
     fill.fill_workbook(channels_fill_events, template_path=template_path, output_path=output_path)
 

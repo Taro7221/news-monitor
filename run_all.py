@@ -82,7 +82,7 @@ def run_fill(channels: list[str], tag: str, output_path: str, use_vlm_labels: bo
 
     return fill.fill_workbook(
         channels_fill_events, output_path=Path(output_path),
-        use_vlm=use_vlm_labels, vlm_text_fn=vlm_text_fn,
+        use_vlm=use_vlm_labels, vlm_text_fn=vlm_text_fn, vlm_judge_fn=vlm_judge_fn,
     )
 
 

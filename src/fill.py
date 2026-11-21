@@ -91,19 +91,78 @@ def default_label_fn(
     return label, low_conf, "；".join(note_parts)
 
 
-def build_cell_plan(fill_events: list[dict], label_fn: Callable[[dict], tuple[str, bool, str]]) -> dict[int, dict]:
-    """把一台的 fill_events 轉成 {row: {"text":, "low_conf":, "notes":[...]}}；
-    同一列（同一分鐘）出現多筆事件時用「/」相連，任一筆低信心度整格就標低信心度。"""
+def consolidate_same_minute_events(
+    events: list[dict],
+    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
+    similarity_fn: Callable[[str, str], float] = segment.default_similarity,
+    high_threshold: float = segment.MERGE_HIGH_THRESHOLD,
+    low_threshold: float = segment.MERGE_LOW_THRESHOLD,
+) -> list[dict]:
+    """events 是同一分鐘內、已依時間排序的 news fill events（還沒轉五字標，
+    event["label"] 是合併後的代表標題）。
+
+    用文字相似度（模糊地帶可選擇呼叫 vlm_judge_fn）判斷這些候選是不是其實
+    指向同一則新聞——這是為了修正 merge_continuations 因為相似度門檻誤差，
+    把同一則拆成好幾個、剛好都落在同一分鐘的狀況。確認是同一則就合併成一組
+    （只留信心度最高的代表，共用同一個五字標）；確認是不同新聞就保留分開
+    （docs/template_spec.md 的範例證實同分鐘多則是真實存在的合法情況，
+    不能強制整欄只能有一個五字標）。回傳保留下來的代表事件（依時間排序）。"""
+    if len(events) <= 1:
+        return list(events)
+
+    groups: list[list[dict]] = []
+    for ev in events:
+        placed = False
+        for g in groups:
+            rep = max(g, key=lambda e: e["confidence"])
+            score = similarity_fn(rep["label"], ev["label"])
+            if score >= high_threshold:
+                same = True
+            elif score <= low_threshold:
+                same = False
+            elif vlm_judge_fn is not None:
+                same = vlm_judge_fn(rep["label"], ev["label"])
+            else:
+                same = False
+            if same:
+                g.append(ev)
+                placed = True
+                break
+        if not placed:
+            groups.append([ev])
+
+    representatives = [max(g, key=lambda e: e["confidence"]) for g in groups]
+    representatives.sort(key=lambda e: e["video_second"])
+    return representatives
+
+
+def build_cell_plan(
+    fill_events: list[dict],
+    label_fn: Callable[[dict], tuple[str, bool, str]],
+    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
+) -> dict[int, dict]:
+    """把一台的 fill_events 轉成 {row: {"text":, "low_conf":, "notes":[...]}}。
+    同一列（同一分鐘）有多筆 news 事件時，先用 consolidate_same_minute_events
+    確認是否其實是同一則；確認不同的才會用「/」相連。"""
     by_row: dict[int, list[dict]] = {}
     for ev in fill_events:
         row = minute_code_to_row(ev.get("minute_code"))
         if row is None:
             continue
-        label, low_conf, note = label_fn(ev)
-        by_row.setdefault(row, []).append({"label": label, "low_conf": low_conf, "note": note})
+        by_row.setdefault(row, []).append(ev)
 
     plan: dict[int, dict] = {}
-    for row, items in by_row.items():
+    for row, row_events in by_row.items():
+        news_events = [e for e in row_events if e["kind"] == "news"]
+        other_events = [e for e in row_events if e["kind"] != "news"]
+        consolidated_news = consolidate_same_minute_events(news_events, vlm_judge_fn=vlm_judge_fn)
+        ordered = sorted(other_events + consolidated_news, key=lambda e: e["video_second"])
+
+        items = []
+        for ev in ordered:
+            label, low_conf, note = label_fn(ev)
+            items.append({"label": label, "low_conf": low_conf, "note": note})
+
         plan[row] = {
             "text": "/".join(item["label"] for item in items),
             "low_conf": any(item["low_conf"] for item in items),
@@ -128,6 +187,7 @@ def fill_workbook(
     output_path: Path = DEFAULT_OUTPUT_PATH,
     use_vlm: bool = False,
     vlm_text_fn: Optional[Callable] = None,
+    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
 ) -> dict:
     wb = openpyxl.load_workbook(str(template_path))
     ws = wb[SHEET_NAME]
@@ -142,7 +202,7 @@ def fill_workbook(
         def label_fn(ev, _use_vlm=use_vlm, _vlm_text_fn=vlm_text_fn):
             return default_label_fn(ev, use_vlm=_use_vlm, vlm_text_fn=_vlm_text_fn)
 
-        plan = build_cell_plan(fill_events, label_fn)
+        plan = build_cell_plan(fill_events, label_fn, vlm_judge_fn=vlm_judge_fn)
         apply_plan_to_sheet(ws, column, plan)
         stats[channel] = {
             "filled_rows": len(plan),
@@ -189,7 +249,7 @@ def main() -> int:
     stats = fill_workbook(
         channels_fill_events,
         template_path=Path(args.template), output_path=Path(args.output),
-        use_vlm=args.use_vlm_labels, vlm_text_fn=vlm_text_fn,
+        use_vlm=args.use_vlm_labels, vlm_text_fn=vlm_text_fn, vlm_judge_fn=vlm_judge_fn,
     )
 
     print(f"[ok] 輸出 {args.output}")
