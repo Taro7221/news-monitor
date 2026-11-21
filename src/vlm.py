@@ -56,12 +56,20 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import detect  # noqa: E402  (重用 compute_phash)
+sys.path.insert(0, str(ROOT / "tools"))
+import detect  # noqa: E402  (重用 compute_phash / crop_roi)
+import extract_frame  # noqa: E402  (降級鏈：抓相鄰幀)
+import calibrate  # noqa: E402  (降級鏈：讀 ROI 設定)
 
 OUT_DIR = ROOT / "out"
 LOGS_DIR = OUT_DIR / "logs"
 CACHE_PATH = OUT_DIR / "vlm_cache.jsonl"
 TIMING_PATH = LOGS_DIR / "vlm_timing.jsonl"
+DEGRADED_LOG_PATH = LOGS_DIR / "vlm_degraded.jsonl"
+
+HEALTH_CHECK_TIMEOUT = 10
+HEALTH_POLL_INTERVAL = 30
+CONSECUTIVE_FAILURE_HEALTH_CHECK = 3
 
 DEFAULT_TIMEOUT = 180  # 秒；Colab 冷啟動 + CPU/GPU 推論可能偏慢
 DEFAULT_MAX_RETRIES = 3
@@ -285,6 +293,27 @@ def call_vlm_once(env: dict, full_b64: str, crop_b64: str, timeout: int, **paylo
     return result, timing
 
 
+# requests.exceptions.ConnectionError / Timeout 代表「根本連不到伺服器」（通道斷線、逾時無回應）；
+# 這類錯誤交給健康檢查+等待處理，絕對不能當成「這張圖的結果」快取起來。
+# HTTPError（resp.raise_for_status() 丟出）代表伺服器有回應、只是狀態碼不對（如 500）；
+# VLMResponseError 代表伺服器有回應、但內容不符合 schema。這兩類都歸類成 "response"，
+# 交給降級鏈處理（縮圖／相鄰幀／low_conf），因為問題看起來跟這張圖或這次請求有關，不是斷線。
+CONNECTION_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+class VLMCallFailed(RuntimeError):
+    """call_vlm_with_retries 重試耗盡後丟出，帶著失敗分類方便上層決定下一步。"""
+
+    def __init__(self, category: str, last_exc: Exception):
+        self.category = category  # "connection" | "response"
+        self.last_exc = last_exc
+        super().__init__(f"VLM 呼叫失敗（分類：{category}），重試耗盡: {last_exc!r}")
+
+
 def call_vlm_with_retries(
     env: dict,
     full_b64: str,
@@ -296,8 +325,10 @@ def call_vlm_with_retries(
     attempts_out: Optional[list] = None,
     **payload_kwargs,
 ) -> dict:
-    """attempts_out（若提供）會被附加每一次嘗試的計時紀錄，不論最後成功或失敗。"""
+    """attempts_out（若提供）會被附加每一次嘗試的計時紀錄，不論最後成功或失敗。
+    重試耗盡後丟出 VLMCallFailed，帶著分類（connection/response）給上層決定後續處理。"""
     last_exc: Optional[Exception] = None
+    last_category = "response"
     for attempt in range(max_retries):
         start = time.perf_counter()
         try:
@@ -306,19 +337,126 @@ def call_vlm_with_retries(
             if attempts_out is not None:
                 attempts_out.append(timing)
             return result
+        except CONNECTION_EXCEPTIONS as e:
+            category = "connection"
+            exc: Exception = e
         except (requests.exceptions.RequestException, VLMResponseError) as e:
-            wall_seconds = time.perf_counter() - start
-            if attempts_out is not None:
-                attempts_out.append({
-                    "attempt": attempt + 1,
-                    "wall_seconds": wall_seconds,
-                    "success": False,
-                    "error": repr(e),
-                })
-            last_exc = e
-            if attempt < max_retries - 1:
-                sleep_fn(backoff_seconds * (2 ** attempt))
-    raise RuntimeError(f"VLM 呼叫失敗，重試 {max_retries} 次仍失敗: {last_exc!r}") from last_exc
+            category = "response"
+            exc = e
+
+        wall_seconds = time.perf_counter() - start
+        if attempts_out is not None:
+            attempts_out.append({
+                "attempt": attempt + 1,
+                "wall_seconds": wall_seconds,
+                "success": False,
+                "error": repr(exc),
+                "error_category": category,
+            })
+        last_exc = exc
+        last_category = category
+        if attempt < max_retries - 1:
+            sleep_fn(backoff_seconds * (2 ** attempt))
+    raise VLMCallFailed(last_category, last_exc)
+
+
+# ---------- 健康檢查 ----------
+
+def check_health(env: dict, timeout: int = HEALTH_CHECK_TIMEOUT) -> bool:
+    """呼叫 /api/tags 確認伺服器連得到、回應正常。連不到／逾時／非 200 都回 False。"""
+    try:
+        auth = HTTPBasicAuth(env["user"], env["password"]) if env["user"] else None
+        resp = requests.get(f"{env['url']}/api/tags", auth=auth, timeout=timeout)
+        return resp.status_code == 200
+    except requests.exceptions.RequestException:
+        return False
+
+
+def wait_until_healthy(
+    env: dict,
+    poll_interval: float = HEALTH_POLL_INTERVAL,
+    check_fn: Callable[[dict], bool] = check_health,
+    sleep_fn=time.sleep,
+) -> None:
+    """卡住直到健康檢查通過為止，每次等待都印「VLM 離線，等待中」。恢復後直接返回。"""
+    while not check_fn(env):
+        print("[health] VLM 離線，等待中...")
+        sleep_fn(poll_interval)
+
+
+# ---------- 降級鏈（只用在伺服器有回應、但對特定圖片持續失敗的情況） ----------
+
+def low_conf_placeholder() -> dict:
+    return {"screen_type": "other", "main_title": "", "main_title_visible": False, "confidence": 0.0}
+
+
+def log_degraded(record: dict) -> None:
+    DEGRADED_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(DEGRADED_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def try_degraded_chain(
+    env: dict,
+    channel: str,
+    video_second: int,
+    full_path: Path,
+    crop_path: Path,
+    roi_config: dict,
+    timeout: int = DEFAULT_TIMEOUT,
+    attempts_out: Optional[list] = None,
+    call_fn: Callable = call_vlm_once,
+) -> tuple[dict, str]:
+    """依序試：(1) 把整張畫面縮更小再送一次 (2) 改用相鄰 +1/-1 秒的畫面
+    (3) 都不行就回傳 low_conf 佔位結果。回傳 (result, degraded_via)。
+    只應該在「伺服器有回應、但這次/這張圖一直失敗」時呼叫（category == "response"）。"""
+
+    def record_attempt(tag: str, timing: dict) -> None:
+        if attempts_out is not None:
+            t = dict(timing)
+            t["attempt"] = tag
+            attempts_out.append(t)
+
+    # (1) 縮更小的圖再試一次
+    try:
+        full_img = cv2.imread(str(full_path))
+        crop_img = cv2.imread(str(crop_path))
+        if full_img is not None and crop_img is not None:
+            small_full_b64 = image_to_base64(
+                resize_for_full(full_img, max_width=FULL_IMAGE_MAX_WIDTH // 2), quality=60
+            )
+            crop_b64 = image_to_base64(crop_img, quality=CROP_JPEG_QUALITY)
+            result, timing = call_fn(env, small_full_b64, crop_b64, timeout)
+            record_attempt("degraded_shrink", timing)
+            return result, "shrink"
+    except Exception:
+        pass
+
+    # (2) 相鄰幀：先 +1 秒，再 -1 秒
+    headline_roi = roi_config.get(channel, {}).get("headline_bar")
+    if headline_roi:
+        video_path = detect.VIDEOS_DIR / f"{channel}.mp4"
+        for offset in (1, -1):
+            try:
+                adjacent_second = max(0, video_second + offset)
+                frame, _actual = extract_frame.extract_frame(video_path, adjacent_second)
+                if frame is None:
+                    continue
+                crop = detect.crop_roi(frame, headline_roi)
+                full_b64 = image_to_base64(resize_for_full(frame), quality=FULL_IMAGE_JPEG_QUALITY)
+                crop_b64 = image_to_base64(crop, quality=CROP_JPEG_QUALITY)
+                result, timing = call_fn(env, full_b64, crop_b64, timeout)
+                record_attempt(f"degraded_adjacent_{offset:+d}s", timing)
+                return result, f"adjacent_{offset:+d}s"
+            except Exception:
+                continue
+
+    # (3) 放棄：回傳低信心佔位結果，並記錄到 out/logs/vlm_degraded.jsonl 供人工追查
+    log_degraded({
+        "channel": channel, "video_second": video_second,
+        "image_path": str(full_path), "crop_path": str(crop_path),
+    })
+    return low_conf_placeholder(), "low_conf_fallback"
 
 
 # ---------- 快取 / 計時紀錄（皆執行緒安全） ----------
@@ -387,9 +525,20 @@ def query_image_pair(
     timeout: int = DEFAULT_TIMEOUT,
     max_retries: int = DEFAULT_MAX_RETRIES,
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
+    channel: Optional[str] = None,
+    video_second: Optional[int] = None,
+    roi_config: Optional[dict] = None,
+    wait_fn: Callable[[dict], None] = wait_until_healthy,
     **payload_kwargs,
 ) -> dict:
-    """查一組（整張畫面, 裁切圖），先查快取，沒有才真的呼叫 VLM 並寫入快取。"""
+    """查一組（整張畫面, 裁切圖），先查快取，沒有才真的呼叫 VLM 並寫入快取。
+
+    失敗分類後的處理：
+    - "connection"（連不到伺服器）：呼叫 wait_fn 卡住直到健康檢查恢復，
+      恢復後重新打一輪完整的重試（不放棄、不當成結果）。
+    - "response"（伺服器有回應但失敗，如 5xx／內容不符 schema）：交給
+      try_degraded_chain 依序嘗試縮圖／相鄰幀／low_conf 佔位。
+    """
     full_b64, crop_b64, full_bytes, crop_bytes = load_image_pair_base64(full_path, crop_path)
     key = compute_cache_key(full_bytes, crop_bytes)
 
@@ -397,17 +546,33 @@ def query_image_pair(
     if cached is not None:
         return cached
 
-    attempts: list[dict] = []
+    all_attempts: list[dict] = []
+    degraded_via: Optional[str] = None
+    result: Optional[dict] = None
     try:
-        result = call_vlm_with_retries(
-            env, full_b64, crop_b64,
-            timeout=timeout, max_retries=max_retries, backoff_seconds=backoff_seconds,
-            attempts_out=attempts, **payload_kwargs,
-        )
-        return_record = True
+        while True:
+            attempts: list[dict] = []
+            try:
+                result = call_vlm_with_retries(
+                    env, full_b64, crop_b64,
+                    timeout=timeout, max_retries=max_retries, backoff_seconds=backoff_seconds,
+                    attempts_out=attempts, **payload_kwargs,
+                )
+                all_attempts.extend(attempts)
+                break
+            except VLMCallFailed as e:
+                all_attempts.extend(attempts)
+                if e.category == "connection":
+                    wait_fn(env)
+                    continue  # 伺服器恢復後，從頭重新打一輪完整的重試
+                result, degraded_via = try_degraded_chain(
+                    env, channel, video_second, full_path, crop_path, roi_config or {},
+                    timeout=timeout, attempts_out=all_attempts,
+                )
+                break
     finally:
         if timing is not None:
-            for a in attempts:
+            for a in all_attempts:
                 rec = dict(a)
                 if extra_meta:
                     rec.update(extra_meta)
@@ -419,6 +584,8 @@ def query_image_pair(
         "crop_path": str(crop_path.relative_to(ROOT).as_posix()) if crop_path.is_relative_to(ROOT) else str(crop_path),
         "result": result,
     }
+    if degraded_via:
+        record["degraded_via"] = degraded_via
     if extra_meta:
         record.update(extra_meta)
     cache.put(record)
@@ -534,6 +701,9 @@ def process_events_file(
     max_retries: int = DEFAULT_MAX_RETRIES,
     limit: Optional[int] = None,
     progress_every: int = PROGRESS_EVERY,
+    wait_fn: Callable[[dict], None] = wait_until_healthy,
+    health_check_fn: Callable[[dict], bool] = check_health,
+    consecutive_failure_limit: int = CONSECUTIVE_FAILURE_HEALTH_CHECK,
 ) -> dict:
     env = load_vlm_env()
     if not env["url"] or not env["model"]:
@@ -543,6 +713,12 @@ def process_events_file(
     if not events_path.exists():
         print(f"[skip] {events_path} 不存在")
         return {}
+
+    # 每次批次開始前先確認連得到伺服器，連不到就卡住等待（不當成失敗）
+    if not health_check_fn(env):
+        wait_fn(env)
+
+    roi_config = calibrate.load_config()
 
     records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if limit is not None:
@@ -559,9 +735,11 @@ def process_events_file(
     counts["_error"] = 0
     counts["_reused"] = 0
     counts["_skipped_resume"] = 0
+    counts["_degraded"] = 0
     results_by_index: dict[int, dict] = {}
     processed = 0
     start_time = time.perf_counter()
+    consecutive_degraded = 0
 
     with open(out_path, "a", encoding="utf-8") as fout:
         for decision, event in zip(decisions, records):
@@ -602,15 +780,30 @@ def process_events_file(
                 record = query_image_pair(
                     full_path, crop_path, env, cache, timing=timing,
                     extra_meta=meta, timeout=timeout, max_retries=max_retries,
+                    channel=channel, video_second=event.get("video_second"),
+                    roi_config=roi_config, wait_fn=wait_fn,
                 )
                 screen_type = record["result"]["screen_type"]
                 counts[screen_type] = counts.get(screen_type, 0) + 1
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 fout.flush()
                 results_by_index[i] = record
+
+                if record.get("degraded_via") == "low_conf_fallback":
+                    counts["_degraded"] += 1
+                    consecutive_degraded += 1
+                else:
+                    consecutive_degraded = 0
             except Exception as e:
                 counts["_error"] += 1
+                consecutive_degraded += 1
                 print(f"[error] {channel} second={event.get('video_second')}: {e}")
+
+            if consecutive_degraded >= consecutive_failure_limit:
+                print(f"[health] {channel}: 連續 {consecutive_degraded} 筆失敗，主動檢查伺服器狀態")
+                if not health_check_fn(env):
+                    wait_fn(env)
+                consecutive_degraded = 0
 
             processed += 1
             if processed % progress_every == 0:

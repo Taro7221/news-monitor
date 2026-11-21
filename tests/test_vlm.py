@@ -402,10 +402,171 @@ def test_process_events_file_resumes_and_skips_done_seconds(tmp_path, monkeypatc
     monkeypatch.setattr(vlm, "load_vlm_env", lambda: {"url": "http://fake", "user": "u", "password": "p", "model": "m"})
 
     cache = vlm.ResultCache(tmp_path / "cache.jsonl")
-    counts = vlm.process_events_file(events_path, "ftv", cache, out_path)
+    counts = vlm.process_events_file(
+        events_path, "ftv", cache, out_path,
+        health_check_fn=lambda env: True, wait_fn=lambda env: None,
+    )
 
     assert counts["_skipped_resume"] == 1
     assert calls["n"] == 2  # only seconds 1 and 2 actually called
+
+
+# ---------- 例外分類 / 健康檢查 / 降級鏈 ----------
+
+def test_call_vlm_with_retries_categorizes_connection_error(monkeypatch):
+    def fake_post(url, json, auth, timeout):
+        raise requests.exceptions.ConnectionError("tunnel down")
+
+    monkeypatch.setattr(vlm.requests, "post", fake_post)
+    env = {"url": "http://fake", "user": "u", "password": "p", "model": "m"}
+    attempts = []
+    with pytest.raises(vlm.VLMCallFailed) as exc_info:
+        vlm.call_vlm_with_retries(env, "F", "C", max_retries=2, sleep_fn=lambda s: None, attempts_out=attempts)
+    assert exc_info.value.category == "connection"
+    assert all(a["error_category"] == "connection" for a in attempts)
+
+
+def test_call_vlm_with_retries_categorizes_http_500_as_response(monkeypatch):
+    def fake_post(url, json, auth, timeout):
+        return FakeResponse(500, None)
+
+    monkeypatch.setattr(vlm.requests, "post", fake_post)
+    env = {"url": "http://fake", "user": "u", "password": "p", "model": "m"}
+    attempts = []
+    with pytest.raises(vlm.VLMCallFailed) as exc_info:
+        vlm.call_vlm_with_retries(env, "F", "C", max_retries=2, sleep_fn=lambda s: None, attempts_out=attempts)
+    assert exc_info.value.category == "response"
+    assert all(a["error_category"] == "response" for a in attempts)
+
+
+def test_check_health_true_on_200(monkeypatch):
+    def fake_get(url, auth, timeout):
+        return FakeResponse(200, None)
+
+    monkeypatch.setattr(vlm.requests, "get", fake_get)
+    assert vlm.check_health({"url": "http://fake", "user": "", "password": ""}) is True
+
+
+def test_check_health_false_on_connection_error(monkeypatch):
+    def fake_get(url, auth, timeout):
+        raise requests.exceptions.ConnectionError("down")
+
+    monkeypatch.setattr(vlm.requests, "get", fake_get)
+    assert vlm.check_health({"url": "http://fake", "user": "", "password": ""}) is False
+
+
+def test_check_health_false_on_non_200(monkeypatch):
+    def fake_get(url, auth, timeout):
+        return FakeResponse(404, None)
+
+    monkeypatch.setattr(vlm.requests, "get", fake_get)
+    assert vlm.check_health({"url": "http://fake", "user": "", "password": ""}) is False
+
+
+def test_wait_until_healthy_polls_until_true():
+    calls = {"n": 0}
+
+    def fake_check(env):
+        calls["n"] += 1
+        return calls["n"] >= 3
+
+    sleeps = []
+    vlm.wait_until_healthy({}, poll_interval=30, check_fn=fake_check, sleep_fn=sleeps.append)
+    assert calls["n"] == 3
+    assert sleeps == [30, 30]  # 睡了兩次（第1、2次檢查失敗後），第3次成功就不再睡
+
+
+def test_try_degraded_chain_shrink_succeeds():
+    call_log = []
+
+    def fake_call(env, full_b64, crop_b64, timeout):
+        call_log.append("called")
+        return {"screen_type": "news", "main_title": "x", "main_title_visible": True, "confidence": 0.5}, {"success": True}
+
+    img = np.zeros((50, 80, 3), dtype=np.uint8)
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        full_path = Path(d) / "full.jpg"
+        crop_path = Path(d) / "crop.jpg"
+        cv2.imwrite(str(full_path), img)
+        cv2.imwrite(str(crop_path), img)
+        result, degraded_via = vlm.try_degraded_chain(
+            {}, "ftv", 100, full_path, crop_path, {}, call_fn=fake_call,
+        )
+    assert degraded_via == "shrink"
+    assert result["main_title"] == "x"
+    assert call_log == ["called"]
+
+
+def test_try_degraded_chain_falls_back_to_low_conf(tmp_path, monkeypatch):
+    monkeypatch.setattr(vlm, "DEGRADED_LOG_PATH", tmp_path / "degraded.jsonl")
+
+    def always_fail(env, full_b64, crop_b64, timeout):
+        raise requests.exceptions.HTTPError("500")
+
+    img = np.zeros((50, 80, 3), dtype=np.uint8)
+    full_path = tmp_path / "full.jpg"
+    crop_path = tmp_path / "crop.jpg"
+    cv2.imwrite(str(full_path), img)
+    cv2.imwrite(str(crop_path), img)
+
+    result, degraded_via = vlm.try_degraded_chain(
+        {}, "ftv", 100, full_path, crop_path, {}, call_fn=always_fail,  # roi_config={} -> 跳過相鄰幀
+    )
+    assert degraded_via == "low_conf_fallback"
+    assert result == vlm.low_conf_placeholder()
+    assert (tmp_path / "degraded.jsonl").exists()
+
+
+def test_query_image_pair_waits_for_health_then_succeeds_on_connection_error(tmp_path, monkeypatch):
+    full_path = tmp_path / "full.jpg"
+    crop_path = tmp_path / "crop.jpg"
+    _write_test_image(full_path)
+    _write_test_image(crop_path)
+    monkeypatch.setattr(vlm, "ROOT", tmp_path)
+
+    calls = {"n": 0}
+
+    def fake_post(url, json, auth, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise requests.exceptions.ConnectionError("down")
+        return FakeResponse(200, make_valid_body())
+
+    monkeypatch.setattr(vlm.requests, "post", fake_post)
+    wait_calls = []
+    cache = vlm.ResultCache(tmp_path / "cache.jsonl")
+    env = {"url": "http://fake", "user": "u", "password": "p", "model": "m"}
+
+    record = vlm.query_image_pair(
+        full_path, crop_path, env, cache,
+        max_retries=1,  # 第一輪只試 1 次就判定 connection 失敗，逼出等待路徑
+        wait_fn=wait_calls.append,
+    )
+    assert record["result"]["screen_type"] == "news"
+    assert len(wait_calls) == 1  # 真的呼叫了 wait_fn 一次才重試成功
+
+
+def test_query_image_pair_degrades_on_persistent_response_error(tmp_path, monkeypatch):
+    full_path = tmp_path / "full.jpg"
+    crop_path = tmp_path / "crop.jpg"
+    _write_test_image(full_path)
+    _write_test_image(crop_path)
+    monkeypatch.setattr(vlm, "ROOT", tmp_path)
+    monkeypatch.setattr(vlm, "DEGRADED_LOG_PATH", tmp_path / "degraded.jsonl")
+
+    def fake_post(url, json, auth, timeout):
+        return FakeResponse(500, None)
+
+    monkeypatch.setattr(vlm.requests, "post", fake_post)
+    cache = vlm.ResultCache(tmp_path / "cache.jsonl")
+    env = {"url": "http://fake", "user": "u", "password": "p", "model": "m"}
+
+    record = vlm.query_image_pair(
+        full_path, crop_path, env, cache, max_retries=1, roi_config={},
+    )
+    assert record["degraded_via"] == "low_conf_fallback"
+    assert record["result"] == vlm.low_conf_placeholder()
 
 
 def test_query_image_pair_logs_timing(tmp_path, monkeypatch):
