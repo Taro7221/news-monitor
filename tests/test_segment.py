@@ -321,6 +321,44 @@ def test_build_segments_for_channel_end_to_end(tmp_path):
     assert segments[1]["representative_title"] == "乙則新聞標題"
 
 
+def test_build_fill_events_combines_ad_and_news_in_time_order(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = []
+
+    def rec(sec, screen_type, title="", visible=True, conf=0.9, minute=1200):
+        return {
+            "video_second": sec, "minute_code": minute,
+            "result": {"screen_type": screen_type, "main_title": title, "main_title_visible": visible, "confidence": conf},
+        }
+
+    records.append(rec(0, "news", "甲則新聞", minute=1200))
+    for sec in (30, 31, 32):
+        records.append(rec(sec, "full_ad", "", minute=1200))
+    records.append(rec(60, "news", "乙則新聞", minute=1201))
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    events = segment.build_fill_events("ftv", path, low_conf_log_path=tmp_path / "low_conf.jsonl")
+    kinds = [(e["kind"], e["label"]) for e in events]
+    assert kinds == [("news", "甲則新聞"), ("ad", "廣告"), ("news", "乙則新聞")]
+    assert [e["video_second"] for e in events] == [0, 32, 60]
+    assert events[1]["minute_code"] == 1200
+    assert events[2]["minute_code"] == 1201
+
+
+def test_build_fill_events_no_ad_when_streak_too_short(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = [
+        {"video_second": 0, "minute_code": 1200, "result": {"screen_type": "news", "main_title": "甲", "main_title_visible": True, "confidence": 0.9}},
+        {"video_second": 30, "minute_code": 1200, "result": {"screen_type": "full_ad", "main_title": "", "main_title_visible": False, "confidence": 0.9}},
+        {"video_second": 60, "minute_code": 1201, "result": {"screen_type": "news", "main_title": "甲", "main_title_visible": True, "confidence": 0.9}},
+    ]
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+    events = segment.build_fill_events("ftv", path, low_conf_log_path=tmp_path / "low_conf.jsonl")
+    assert all(e["kind"] == "news" for e in events)
+
+
 def test_build_segments_for_channel_logs_low_confidence(tmp_path):
     import json as json_mod
     path = tmp_path / "ftv_vlm.jsonl"

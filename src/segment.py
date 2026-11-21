@@ -278,6 +278,7 @@ def _finalize_segment(segment: dict, similarity_fn: Callable[[str, str], float])
         "titles": segment["titles"],
         "representative_title": representative,
         "merged_count": len(segment["titles"]),
+        "avg_confidence": sum(segment["confidences"]) / len(segment["confidences"]),
         "ambiguous_next": segment["ambiguous_next"],
     }
 
@@ -412,6 +413,7 @@ def load_vlm_results(path: Path) -> list[dict]:
         result = rec.get("result", {})
         frames.append({
             "video_second": rec["video_second"],
+            "minute_code": rec.get("minute_code"),
             "screen_type": result.get("screen_type"),
             "main_title": result.get("main_title", ""),
             "main_title_visible": result.get("main_title_visible", False),
@@ -421,22 +423,14 @@ def load_vlm_results(path: Path) -> list[dict]:
     return frames
 
 
-def build_segments_for_channel(
+def _resolve_headline_events(
     channel: str,
-    vlm_results_path: Path,
-    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
-    confidence_threshold: float = LOW_CONFIDENCE_THRESHOLD,
-    low_conf_log_path: Path = LOW_CONF_LOG_PATH,
+    frames: list[dict],
+    headline_events: list[dict],
+    confidence_threshold: float,
+    low_conf_log_path: Path,
 ) -> list[dict]:
-    """本機分段流程：讀 vlm 結果 -> 狀態機 -> 低信心度多數決 -> 合併同一則。
-    不呼叫任何 VLM（vlm_judge_fn 預設 None，五字標生成要另外呼叫
-    generate_five_char_label）。"""
-    frames = load_vlm_results(vlm_results_path)
     frame_index_by_second = {f["video_second"]: i for i, f in enumerate(frames)}
-
-    raw_events = run_state_machine(frames)
-    headline_events = [e for e in raw_events if e["type"] == "headline"]
-
     resolved_events = []
     for ev in headline_events:
         idx = frame_index_by_second[ev["video_second"]]
@@ -455,8 +449,74 @@ def build_segments_for_channel(
             "video_second": resolved["video_second"], "title": resolved["title"],
             "confidence": resolved["confidence"],
         })
+    return resolved_events
 
+
+def build_segments_for_channel(
+    channel: str,
+    vlm_results_path: Path,
+    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
+    confidence_threshold: float = LOW_CONFIDENCE_THRESHOLD,
+    low_conf_log_path: Path = LOW_CONF_LOG_PATH,
+) -> list[dict]:
+    """本機分段流程：讀 vlm 結果 -> 狀態機 -> 低信心度多數決 -> 合併同一則。
+    不呼叫任何 VLM（vlm_judge_fn 預設 None，五字標生成要另外呼叫
+    generate_five_char_label）。"""
+    frames = load_vlm_results(vlm_results_path)
+    raw_events = run_state_machine(frames)
+    headline_events = [e for e in raw_events if e["type"] == "headline"]
+    resolved_events = _resolve_headline_events(
+        channel, frames, headline_events, confidence_threshold, low_conf_log_path,
+    )
     return merge_continuations(resolved_events, vlm_judge_fn=vlm_judge_fn)
+
+
+def build_fill_events(
+    channel: str,
+    vlm_results_path: Path,
+    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
+    confidence_threshold: float = LOW_CONFIDENCE_THRESHOLD,
+    low_conf_log_path: Path = LOW_CONF_LOG_PATH,
+) -> list[dict]:
+    """給 fill.py 用：把「新聞則」跟「進廣告」合併成一條依時間排序的填表事件清單。
+    每筆 {"video_second":, "minute_code":, "kind": "news"|"ad", "label":,
+    "confidence":, "ambiguous_next":}。
+    kind=="ad" 的 label 固定是「廣告」，不需要呼叫任何 VLM；kind=="news" 的
+    label 是合併後的代表標題（還不是五字標，fill.py 要另外呼叫
+    generate_five_char_label 轉成 5 個字）。"""
+    frames = load_vlm_results(vlm_results_path)
+    minute_by_second = {f["video_second"]: f["minute_code"] for f in frames}
+
+    raw_events = run_state_machine(frames)
+    headline_events = [e for e in raw_events if e["type"] == "headline"]
+    resolved_events = _resolve_headline_events(
+        channel, frames, headline_events, confidence_threshold, low_conf_log_path,
+    )
+    segments = merge_continuations(resolved_events, vlm_judge_fn=vlm_judge_fn)
+
+    fill_events = []
+    for seg in segments:
+        fill_events.append({
+            "video_second": seg["start_second"],
+            "minute_code": minute_by_second.get(seg["start_second"]),
+            "kind": "news",
+            "label": seg["representative_title"],
+            "confidence": seg["avg_confidence"],
+            "ambiguous_next": seg["ambiguous_next"],
+        })
+    for ev in raw_events:
+        if ev["type"] == "ad_start":
+            fill_events.append({
+                "video_second": ev["video_second"],
+                "minute_code": minute_by_second.get(ev["video_second"]),
+                "kind": "ad",
+                "label": "廣告",
+                "confidence": 1.0,
+                "ambiguous_next": None,
+            })
+
+    fill_events.sort(key=lambda e: e["video_second"])
+    return fill_events
 
 
 def main() -> int:

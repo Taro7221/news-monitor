@@ -126,11 +126,13 @@ def detect_changes(
     return events
 
 
-def iter_seconds(video_path: Path, max_seconds: Optional[int] = None):
-    """循序解碼整支影片，每秒 yield 一次 (second, frame)。
+def iter_seconds(video_path: Path, start_second: int = 0, max_seconds: Optional[int] = None):
+    """循序解碼整支影片，從 start_second 開始每秒 yield 一次 (second, frame)，
+    處理到 start_second + max_seconds 為止（max_seconds 為 None 代表到影片結尾）。
 
     用 grab()/retrieve() 循序解碼而不是重複 seek，避免對壓縮影片做大量
-    random seek 造成的不穩定與效能問題。
+    random seek 造成的不穩定與效能問題；start_second 之前的幀只 grab() 不
+    retrieve()，跳過解碼/複製成本但仍是循序走過去。
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -140,11 +142,12 @@ def iter_seconds(video_path: Path, max_seconds: Optional[int] = None):
         cap.release()
         return
 
+    end_second = (start_second + max_seconds) if max_seconds is not None else None
     frame_idx = 0
-    next_second = 0
+    next_second = start_second
     try:
         while True:
-            if max_seconds is not None and next_second > max_seconds:
+            if end_second is not None and next_second >= end_second:
                 break
             ok = cap.grab()
             if not ok:
@@ -169,7 +172,9 @@ def process_channel(
     stable_seconds: int = DEFAULT_STABLE_SECONDS,
     heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL,
     hash_size: int = DEFAULT_HASH_SIZE,
+    start_second: int = 0,
     max_seconds: Optional[int] = None,
+    events_path: Optional[Path] = None,
 ) -> int:
     video_path = VIDEOS_DIR / f"{channel}.mp4"
     if not video_path.exists():
@@ -183,7 +188,8 @@ def process_channel(
 
     channel_frames_dir = FRAMES_DIR / channel
     channel_frames_dir.mkdir(parents=True, exist_ok=True)
-    events_path = OUT_DIR / f"{channel}_events.jsonl"
+    if events_path is None:
+        events_path = OUT_DIR / f"{channel}_events.jsonl"
 
     def make_record(
         second: int, kind: str, phash: imagehash.ImageHash, full_path: Path, crop_path: Path
@@ -214,7 +220,7 @@ def process_channel(
 
     event_count = 0
     with open(events_path, "w", encoding="utf-8") as f:
-        for second, frame in iter_seconds(video_path, max_seconds=max_seconds):
+        for second, frame in iter_seconds(video_path, start_second=start_second, max_seconds=max_seconds):
             crop = crop_roi(frame, headline_roi)
             phash = compute_phash(crop, hash_size=hash_size)
             series.append((second, phash))
@@ -246,7 +252,9 @@ def main() -> int:
     parser.add_argument("--stable-seconds", type=int, default=DEFAULT_STABLE_SECONDS)
     parser.add_argument("--heartbeat-interval", type=int, default=DEFAULT_HEARTBEAT_INTERVAL)
     parser.add_argument("--hash-size", type=int, default=DEFAULT_HASH_SIZE)
-    parser.add_argument("--max-seconds", type=int, default=None, help="只處理前 N 秒（除錯用）")
+    parser.add_argument("--start-second", type=int, default=0, help="從影片第幾秒開始處理")
+    parser.add_argument("--max-seconds", type=int, default=None, help="處理幾秒（從 --start-second 起算；除錯/測試用）")
+    parser.add_argument("--tag", type=str, default="", help="輸出檔名加的標記，例如 --tag _15min -> out/{channel}_15min_events.jsonl（避免覆蓋正式全量資料）")
     args = parser.parse_args()
 
     roi_config = calibrate.load_config()
@@ -257,6 +265,7 @@ def main() -> int:
 
     summary = {}
     for channel in args.channels:
+        events_path = OUT_DIR / f"{channel}{args.tag}_events.jsonl"
         count = process_channel(
             channel,
             roi_config,
@@ -265,7 +274,9 @@ def main() -> int:
             stable_seconds=args.stable_seconds,
             heartbeat_interval=args.heartbeat_interval,
             hash_size=args.hash_size,
+            start_second=args.start_second,
             max_seconds=args.max_seconds,
+            events_path=events_path,
         )
         summary[channel] = count
 

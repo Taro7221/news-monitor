@@ -372,13 +372,23 @@ def check_health(env: dict, timeout: int = HEALTH_CHECK_TIMEOUT) -> bool:
         return False
 
 
+def reload_and_check_health(_env: Optional[dict] = None, timeout: int = HEALTH_CHECK_TIMEOUT) -> bool:
+    """跟 check_health 一樣，但每次都先重新讀 .env 再檢查——這樣 ngrok 網址換了、
+    使用者更新 .env 之後，不用重啟整個批次，下一次健康檢查／等待輪詢就會吃到新網址。
+    接受但忽略 _env 參數，只是為了跟 check_health 一樣的呼叫介面（供 wait_until_healthy
+    的 check_fn(env) 呼叫慣例相容）。"""
+    return check_health(load_vlm_env(), timeout=timeout)
+
+
 def wait_until_healthy(
     env: dict,
     poll_interval: float = HEALTH_POLL_INTERVAL,
-    check_fn: Callable[[dict], bool] = check_health,
+    check_fn: Callable[[dict], bool] = reload_and_check_health,
     sleep_fn=time.sleep,
 ) -> None:
-    """卡住直到健康檢查通過為止，每次等待都印「VLM 離線，等待中」。恢復後直接返回。"""
+    """卡住直到健康檢查通過為止，每次等待都印「VLM 離線，等待中」。恢復後直接返回。
+    預設的 check_fn 每次都會重新讀 .env（見 reload_and_check_health），所以卡住等待
+    期間如果使用者更新了 VLM_URL，下一輪 30 秒輪詢就會用新網址檢查。"""
     while not check_fn(env):
         print("[health] VLM 離線，等待中...")
         sleep_fn(poll_interval)
@@ -564,6 +574,7 @@ def query_image_pair(
                 all_attempts.extend(attempts)
                 if e.category == "connection":
                     wait_fn(env)
+                    env = load_vlm_env()  # .env 可能被更新了（例如 ngrok 網址換了），重新讀取再繼續
                     continue  # 伺服器恢復後，從頭重新打一輪完整的重試
                 result, degraded_via = try_degraded_chain(
                     env, channel, video_second, full_path, crop_path, roi_config or {},
@@ -702,7 +713,7 @@ def process_events_file(
     limit: Optional[int] = None,
     progress_every: int = PROGRESS_EVERY,
     wait_fn: Callable[[dict], None] = wait_until_healthy,
-    health_check_fn: Callable[[dict], bool] = check_health,
+    health_check_fn: Callable[[dict], bool] = reload_and_check_health,
     consecutive_failure_limit: int = CONSECUTIVE_FAILURE_HEALTH_CHECK,
 ) -> dict:
     env = load_vlm_env()
@@ -717,6 +728,7 @@ def process_events_file(
     # 每次批次開始前先確認連得到伺服器，連不到就卡住等待（不當成失敗）
     if not health_check_fn(env):
         wait_fn(env)
+        env = load_vlm_env()  # .env 可能被更新了（例如 ngrok 網址換了），重新讀取再繼續
 
     roi_config = calibrate.load_config()
 
@@ -803,6 +815,7 @@ def process_events_file(
                 print(f"[health] {channel}: 連續 {consecutive_degraded} 筆失敗，主動檢查伺服器狀態")
                 if not health_check_fn(env):
                     wait_fn(env)
+                    env = load_vlm_env()  # .env 可能被更新了（例如 ngrok 網址換了），重新讀取再繼續
                 consecutive_degraded = 0
 
             processed += 1
@@ -826,12 +839,13 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None, help="只處理前 N 筆（除錯用）")
     parser.add_argument("--workers", type=int, default=4, help="並行處理的頻道數")
     parser.add_argument("--estimate-only", action="store_true", help="只印本機去重後的筆數估計，不打網路")
+    parser.add_argument("--tag", type=str, default="", help="讀/寫檔名加的標記（跟 detect.py 的 --tag 對應），例如 --tag _test15 -> 讀 out/{channel}_test15_events.jsonl、寫 out/{channel}_test15_vlm.jsonl；channel 本身維持原名，降級鏈抓相鄰幀才找得到正確的影片檔")
     args = parser.parse_args()
 
     if args.events and args.channel:
         jobs = [(args.channel, Path(args.events))]
     else:
-        jobs = [(ch, OUT_DIR / f"{ch}_events.jsonl") for ch in args.channels]
+        jobs = [(ch, OUT_DIR / f"{ch}{args.tag}_events.jsonl") for ch in args.channels]
 
     if args.estimate_only:
         print("=== 本機去重估計（不打網路） ===")
@@ -846,7 +860,7 @@ def main() -> int:
     summary = {}
 
     def run_job(channel, events_path):
-        out_path = OUT_DIR / f"{channel}_vlm.jsonl"
+        out_path = OUT_DIR / f"{channel}{args.tag}_vlm.jsonl"
         return channel, process_events_file(
             events_path, channel, cache, out_path, timing=timing,
             timeout=args.timeout, max_retries=args.max_retries, limit=args.limit,

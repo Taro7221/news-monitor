@@ -518,6 +518,78 @@ def test_try_degraded_chain_falls_back_to_low_conf(tmp_path, monkeypatch):
     assert (tmp_path / "degraded.jsonl").exists()
 
 
+def test_reload_and_check_health_reads_env_fresh_each_call(monkeypatch):
+    urls_seen = []
+
+    def fake_get(url, auth, timeout):
+        urls_seen.append(url)
+        return FakeResponse(200, None)
+
+    envs = [{"url": "http://old", "user": "", "password": ""}, {"url": "http://new", "user": "", "password": ""}]
+
+    def fake_load_vlm_env():
+        return envs.pop(0)
+
+    monkeypatch.setattr(vlm.requests, "get", fake_get)
+    monkeypatch.setattr(vlm, "load_vlm_env", fake_load_vlm_env)
+
+    assert vlm.reload_and_check_health() is True
+    assert vlm.reload_and_check_health() is True
+    assert urls_seen == ["http://old/api/tags", "http://new/api/tags"]
+
+
+def test_wait_until_healthy_default_check_fn_picks_up_env_change_mid_wait(monkeypatch):
+    # 模擬：第一次輪詢時 .env 還是舊網址（連不到），第二次輪詢前使用者把 .env 換成新網址
+    load_calls = {"n": 0}
+
+    def fake_load_vlm_env():
+        load_calls["n"] += 1
+        return {"url": "http://old", "user": "", "password": ""} if load_calls["n"] == 1 else {"url": "http://new", "user": "", "password": ""}
+
+    def fake_get(url, auth, timeout):
+        if "old" in url:
+            raise requests.exceptions.ConnectionError("down")
+        return FakeResponse(200, None)
+
+    monkeypatch.setattr(vlm, "load_vlm_env", fake_load_vlm_env)
+    monkeypatch.setattr(vlm.requests, "get", fake_get)
+
+    sleeps = []
+    vlm.wait_until_healthy({}, poll_interval=30, sleep_fn=sleeps.append)  # 用預設 check_fn=reload_and_check_health
+    assert load_calls["n"] == 2
+    assert sleeps == [30]
+
+
+def test_query_image_pair_reloads_env_after_connection_wait(tmp_path, monkeypatch):
+    full_path = tmp_path / "full.jpg"
+    crop_path = tmp_path / "crop.jpg"
+    _write_test_image(full_path)
+    _write_test_image(crop_path)
+    monkeypatch.setattr(vlm, "ROOT", tmp_path)
+
+    posted_urls = []
+
+    def fake_post(url, json, auth, timeout):
+        posted_urls.append(url)
+        if url.startswith("http://old"):
+            raise requests.exceptions.ConnectionError("down")
+        return FakeResponse(200, make_valid_body())
+
+    monkeypatch.setattr(vlm.requests, "post", fake_post)
+    cache = vlm.ResultCache(tmp_path / "cache.jsonl")
+    old_env = {"url": "http://old", "user": "u", "password": "p", "model": "m"}
+    new_env = {"url": "http://new", "user": "u", "password": "p", "model": "m"}
+
+    monkeypatch.setattr(vlm, "load_vlm_env", lambda: new_env)
+
+    record = vlm.query_image_pair(
+        full_path, crop_path, old_env, cache,
+        max_retries=1, wait_fn=lambda env: None,
+    )
+    assert record["result"]["screen_type"] == "news"
+    assert posted_urls == ["http://old/api/chat", "http://new/api/chat"]
+
+
 def test_query_image_pair_waits_for_health_then_succeeds_on_connection_error(tmp_path, monkeypatch):
     full_path = tmp_path / "full.jpg"
     crop_path = tmp_path / "crop.jpg"
