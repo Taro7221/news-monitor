@@ -40,11 +40,45 @@ ROI_LABELS = {
     "logo": "logo (台標)",
 }
 
-DEFAULT_ROI = {
+TICKER_DEFAULT = {"x1": 0.0, "y1": 0.90, "x2": 1.0, "y2": 0.98}
+
+# 依實際截圖觀察到的版型抓的粗略預設值：FTV/CTS 的標題是左下窄色塊
+# （右邊是口白字幕，要排除)；TVBS 標題在右半邊（左邊是地點/股市小部件）；
+# EBC 標題是滿版黃底黑字。這些都只是起點，仍需對照 roi_preview.jpg 微調。
+PER_CHANNEL_DEFAULT_ROI = {
+    "ftv": {
+        "headline_bar": {"x1": 0.0, "y1": 0.78, "x2": 0.23, "y2": 0.90},
+        "ticker": dict(TICKER_DEFAULT),
+        "logo": {"x1": 0.78, "y1": 0.05, "x2": 0.99, "y2": 0.14},
+    },
+    "tvbs": {
+        "headline_bar": {"x1": 0.20, "y1": 0.80, "x2": 1.0, "y2": 0.90},
+        "ticker": dict(TICKER_DEFAULT),
+        "logo": {"x1": 0.76, "y1": 0.04, "x2": 0.99, "y2": 0.11},
+    },
+    "ebc": {
+        "headline_bar": {"x1": 0.0, "y1": 0.79, "x2": 1.0, "y2": 0.89},
+        "ticker": dict(TICKER_DEFAULT),
+        "logo": {"x1": 0.74, "y1": 0.04, "x2": 0.98, "y2": 0.11},
+    },
+    "cts": {
+        "headline_bar": {"x1": 0.0, "y1": 0.78, "x2": 0.22, "y2": 0.89},
+        "ticker": dict(TICKER_DEFAULT),
+        "logo": {"x1": 0.78, "y1": 0.02, "x2": 0.99, "y2": 0.09},
+    },
+}
+
+# 任何不在上面清單裡的頻道，退回這組通用預設值
+FALLBACK_DEFAULT_ROI = {
     "headline_bar": {"x1": 0.0, "y1": 0.80, "x2": 1.0, "y2": 0.90},
-    "ticker": {"x1": 0.0, "y1": 0.92, "x2": 1.0, "y2": 0.98},
+    "ticker": dict(TICKER_DEFAULT),
     "logo": {"x1": 0.02, "y1": 0.03, "x2": 0.15, "y2": 0.12},
 }
+
+
+def default_roi_for_channel(channel: str) -> dict:
+    source = PER_CHANNEL_DEFAULT_ROI.get(channel, FALLBACK_DEFAULT_ROI)
+    return {name: dict(bbox) for name, bbox in source.items()}
 
 
 def sample_frame_indices(total_frames: int, n: int, margin: float = 0.02) -> list[int]:
@@ -74,7 +108,7 @@ def ratio_to_pixels(roi: dict, width: int, height: int) -> tuple[int, int, int, 
 
 
 def build_default_config(channels: list[str]) -> dict:
-    return {ch: {name: dict(bbox) for name, bbox in DEFAULT_ROI.items()} for ch in channels}
+    return {ch: default_roi_for_channel(ch) for ch in channels}
 
 
 def render_default_yaml(channels: list[str]) -> str:
@@ -82,17 +116,18 @@ def render_default_yaml(channels: list[str]) -> str:
         "# ROI 校準設定：每台三個區塊的比例座標 (0~1)",
         "# x1,y1 = 左上角比例座標；x2,y2 = 右下角比例座標",
         "# 影片解析度請看 tools/check_env.py 的輸出；用比例座標可以不受解析度影響",
-        "#   headline_bar: 主標題 bar（新聞標題/五字標顯示區）",
+        "#   headline_bar: 主標題 bar（新聞標題/五字標顯示區，注意排除旁邊的口白字幕/地點/股市小部件）",
         "#   ticker       : 跑馬燈",
         "#   logo         : 台標",
-        "# 這些是粗略預設值，請對照 out/calib/roi_preview.jpg 自行微調後重跑：",
+        "# 這些是依實際截圖抓的粗略預設值，請對照 out/calib/roi_preview.jpg 自行微調後重跑：",
         "#   python tools/calibrate.py --preview-only",
         "",
     ]
     for ch in channels:
         lines.append(f"{ch}:")
+        roi = default_roi_for_channel(ch)
         for name in ROI_NAMES:
-            bbox = DEFAULT_ROI[name]
+            bbox = roi[name]
             lines.append(f"  {name}:")
             lines.append(f"    x1: {bbox['x1']}")
             lines.append(f"    y1: {bbox['y1']}")

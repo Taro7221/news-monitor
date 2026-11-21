@@ -44,6 +44,30 @@ def test_build_default_config_has_all_channels_and_rois():
         assert set(ch_config.keys()) == set(calibrate.ROI_NAMES)
 
 
+def test_per_channel_defaults_differ_by_layout():
+    ftv = calibrate.default_roi_for_channel("ftv")
+    tvbs = calibrate.default_roi_for_channel("tvbs")
+    ebc = calibrate.default_roi_for_channel("ebc")
+    # FTV/CTS: headline is a narrow left box (caption text to its right excluded)
+    assert ftv["headline_bar"]["x2"] < 0.5
+    # TVBS: headline is the right portion (left side is a stock/location widget)
+    assert tvbs["headline_bar"]["x1"] > 0.0
+    # EBC: full-width headline bar
+    assert ebc["headline_bar"]["x1"] == 0.0 and ebc["headline_bar"]["x2"] == 1.0
+
+
+def test_default_roi_for_unknown_channel_falls_back():
+    roi = calibrate.default_roi_for_channel("some_future_channel")
+    assert set(roi.keys()) == set(calibrate.ROI_NAMES)
+
+
+def test_default_roi_mutation_is_isolated_between_calls():
+    first = calibrate.default_roi_for_channel("ftv")
+    first["headline_bar"]["x2"] = 0.99
+    second = calibrate.default_roi_for_channel("ftv")
+    assert second["headline_bar"]["x2"] != 0.99
+
+
 def test_draw_rois_does_not_mutate_input_and_changes_pixels():
     image = np.zeros((100, 200, 3), dtype=np.uint8)
     config = {"headline_bar": {"x1": 0.1, "y1": 0.1, "x2": 0.9, "y2": 0.3}}
