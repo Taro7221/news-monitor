@@ -1,0 +1,13 @@
+opencv-python
+imagehash
+pillow
+numpy
+pandas
+openpyxl
+requests
+python-dotenv
+pyyaml
+tqdm
+rapidfuzz
+pytest
+# librosa  # optional: enable if audio analysis is needed
