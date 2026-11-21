@@ -57,14 +57,21 @@ def run_vlm(channels: list[str], tag: str, timeout: int, max_retries: int) -> No
             future.result()
 
 
-def run_fill(channels: list[str], tag: str, output_path: str, use_vlm_labels: bool) -> dict:
+def run_fill(channels: list[str], tag: str, output_path: str, use_vlm_labels: bool, use_vlm_judge: bool = False) -> dict:
+    vlm_judge_fn = None
+    if use_vlm_judge:
+        judge_env = vlm.load_vlm_env()
+
+        def vlm_judge_fn(title_a, title_b):
+            return segment.call_vlm_judge_same_story(title_a, title_b, judge_env)
+
     channels_fill_events = {}
     for ch in channels:
         vlm_path = fill.OUT_DIR / f"{ch}{tag}_vlm.jsonl"
         if not vlm_path.exists():
             print(f"[skip] {vlm_path} 不存在")
             continue
-        channels_fill_events[ch] = segment.build_fill_events(ch, vlm_path)
+        channels_fill_events[ch] = segment.build_fill_events(ch, vlm_path, vlm_judge_fn=vlm_judge_fn)
 
     vlm_text_fn = None
     if use_vlm_labels:
@@ -113,6 +120,7 @@ def main() -> int:
     parser.add_argument("--gt", type=str, default=str(evaluate.DEFAULT_GT_PATH))
     parser.add_argument("--eval-output", type=str, default=None)
     parser.add_argument("--use-vlm-labels", action="store_true", help="真的呼叫 VLM 產生五字標")
+    parser.add_argument("--use-vlm-judge", action="store_true", help="模糊地帶呼叫 VLM 判斷是否同一則")
     parser.add_argument("--skip-detect", action="store_true")
     parser.add_argument("--skip-vlm", action="store_true")
     parser.add_argument("--skip-fill", action="store_true")
@@ -131,7 +139,7 @@ def main() -> int:
 
     if not args.skip_fill:
         print("\n=== [3/4] fill：填入 Excel ===")
-        stats = run_fill(args.channels, args.tag, args.output_excel, args.use_vlm_labels)
+        stats = run_fill(args.channels, args.tag, args.output_excel, args.use_vlm_labels, args.use_vlm_judge)
         for ch, s in stats.items():
             print(f"  {ch}: 填了 {s['filled_rows']} 列，低信心度 {s['low_conf_rows']} 列")
 

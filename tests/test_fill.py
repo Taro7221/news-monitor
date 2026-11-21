@@ -157,3 +157,46 @@ def test_fill_workbook_marks_low_confidence_with_fill_and_comment(tmp_path):
     cell = ws["N5"]
     assert cell.fill.start_color.rgb in ("00FFFFCC", "FFFFFFCC")
     assert cell.comment is not None
+
+
+def test_main_passes_vlm_judge_fn_when_flag_set(tmp_path, monkeypatch):
+    vlm_path = tmp_path / "ftv_vlm.jsonl"
+    vlm_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(fill, "OUT_DIR", tmp_path)
+
+    captured = {}
+
+    def fake_build_fill_events(channel, path, vlm_judge_fn=None):
+        captured["vlm_judge_fn"] = vlm_judge_fn
+        return []
+
+    monkeypatch.setattr(fill.segment, "build_fill_events", fake_build_fill_events)
+    monkeypatch.setattr(fill, "fill_workbook", lambda *a, **k: {})
+    monkeypatch.setattr(fill.vlm, "load_vlm_env", lambda: {"url": "http://fake", "user": "", "password": "", "model": "m"})
+
+    import sys
+    monkeypatch.setattr(sys, "argv", ["fill.py", "--channels", "ftv", "--use-vlm-judge"])
+    fill.main()
+
+    assert captured["vlm_judge_fn"] is not None
+
+
+def test_main_vlm_judge_fn_none_without_flag(tmp_path, monkeypatch):
+    vlm_path = tmp_path / "ftv_vlm.jsonl"
+    vlm_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(fill, "OUT_DIR", tmp_path)
+
+    captured = {}
+
+    def fake_build_fill_events(channel, path, vlm_judge_fn=None):
+        captured["vlm_judge_fn"] = vlm_judge_fn
+        return []
+
+    monkeypatch.setattr(fill.segment, "build_fill_events", fake_build_fill_events)
+    monkeypatch.setattr(fill, "fill_workbook", lambda *a, **k: {})
+
+    import sys
+    monkeypatch.setattr(sys, "argv", ["fill.py", "--channels", "ftv"])
+    fill.main()
+
+    assert captured["vlm_judge_fn"] is None

@@ -58,3 +58,22 @@ def test_main_passes_tag_and_window_through(monkeypatch):
     run_all.main()
 
     assert captured["detect"] == (["ftv", "cts"], "_test15", 1800, 900)
+
+
+def test_main_passes_use_vlm_judge_through(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(run_all, "run_detect", lambda *a, **k: None)
+    monkeypatch.setattr(run_all, "run_vlm", lambda *a, **k: None)
+
+    def fake_run_fill(channels, tag, output_path, use_vlm_labels, use_vlm_judge=False):
+        captured["fill"] = (use_vlm_labels, use_vlm_judge)
+        return {}
+
+    monkeypatch.setattr(run_all, "run_fill", fake_run_fill)
+    monkeypatch.setattr(run_all, "run_evaluate", lambda *a, **k: None)
+
+    monkeypatch.setattr(sys, "argv", ["run_all.py", "--use-vlm-labels", "--use-vlm-judge"])
+    run_all.main()
+
+    assert captured["fill"] == (True, True)

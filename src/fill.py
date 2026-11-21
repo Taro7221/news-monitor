@@ -161,7 +161,15 @@ def main() -> int:
     parser.add_argument("--template", type=str, default=str(DEFAULT_TEMPLATE_PATH))
     parser.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT_PATH))
     parser.add_argument("--use-vlm-labels", action="store_true", help="真的呼叫 VLM 產生五字標（建議全量批次跑完後再用）")
+    parser.add_argument("--use-vlm-judge", action="store_true", help="模糊地帶（相似度介於門檻之間）呼叫 VLM 判斷是否同一則，而不是保守地當作換則")
     args = parser.parse_args()
+
+    vlm_judge_fn = None
+    if args.use_vlm_judge:
+        judge_env = vlm.load_vlm_env()
+
+        def vlm_judge_fn(title_a, title_b):
+            return segment.call_vlm_judge_same_story(title_a, title_b, judge_env)
 
     channels_fill_events = {}
     for ch in args.channels:
@@ -169,7 +177,7 @@ def main() -> int:
         if not vlm_path.exists():
             print(f"[skip] {vlm_path} 不存在")
             continue
-        channels_fill_events[ch] = segment.build_fill_events(ch, vlm_path)
+        channels_fill_events[ch] = segment.build_fill_events(ch, vlm_path, vlm_judge_fn=vlm_judge_fn)
 
     vlm_text_fn = None
     if args.use_vlm_labels:

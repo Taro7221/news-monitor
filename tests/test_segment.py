@@ -286,6 +286,22 @@ def test_generate_five_char_label_passes_previous_violations_to_retry():
     assert seen_violations[1] is not None  # 第二次重試有拿到上一次的違規原因
 
 
+def test_parse_judge_response_same():
+    assert segment.parse_judge_response("same") is True
+    assert segment.parse_judge_response("Same.") is True
+    assert segment.parse_judge_response("  SAME  ") is True
+
+
+def test_parse_judge_response_different():
+    assert segment.parse_judge_response("different") is False
+    assert segment.parse_judge_response("Different.") is False
+
+
+def test_parse_judge_response_ambiguous_defaults_false():
+    assert segment.parse_judge_response("I'm not sure") is False
+    assert segment.parse_judge_response("") is False
+
+
 # ---------- 整合：load_vlm_results / build_segments_for_channel ----------
 
 def test_load_vlm_results_sorts_by_second(tmp_path):

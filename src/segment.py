@@ -400,6 +400,59 @@ def call_vlm_for_label(
     return content.strip()
 
 
+JUDGE_PROMPT_TEMPLATE = """你是新聞監看助手。下面兩個「標題讀值」是從同一台新聞畫面上不同時間點的
+OCR/VLM 讀值，文字可能因為辨識誤差有些微不同。請判斷這兩個讀值說的是不是同一件新聞事件
+（同一則新聞斷斷續續讀到的不同次結果），而不是兩個不同的新聞事件。
+
+標題A：{title_a}
+標題B：{title_b}
+
+如果是同一件新聞事件，回答 same；如果是兩個不同的新聞事件，回答 different。
+只回傳 same 或 different，不要加任何其他文字。"""
+
+
+def parse_judge_response(content: str) -> bool:
+    """把 call_vlm_judge_same_story 的原始回應文字解析成布林值。
+    無法判斷時保守回傳 False（不合併，維持 merge_continuations 原本沒有
+    vlm_judge_fn 時的保守行為）。"""
+    normalized = content.strip().lower()
+    if normalized.startswith("same"):
+        return True
+    if normalized.startswith("different"):
+        return False
+    if "same" in normalized and "different" not in normalized:
+        return True
+    return False
+
+
+def call_vlm_judge_same_story(
+    title_a: str,
+    title_b: str,
+    env: dict,
+    model: Optional[str] = None,
+    timeout: int = 60,
+) -> bool:
+    """真正會打網路的純文字 VLM 呼叫，判斷兩個標題讀值是不是同一則新聞
+    （給 merge_continuations 當 vlm_judge_fn 用）。"""
+    import requests
+    from requests.auth import HTTPBasicAuth
+
+    prompt = JUDGE_PROMPT_TEMPLATE.format(title_a=title_a, title_b=title_b)
+    payload = {
+        "model": model or env.get("model"),
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0, "num_predict": 10},
+    }
+    auth = HTTPBasicAuth(env["user"], env["password"]) if env.get("user") else None
+    resp = requests.post(f"{env['url']}/api/chat", json=payload, auth=auth, timeout=timeout)
+    resp.raise_for_status()
+    body = resp.json()
+    content = body.get("message", {}).get("content", "")
+    return parse_judge_response(content)
+
+
 # ---------- 整合：單一頻道的分段流程（本機、不呼叫任何 VLM） ----------
 
 def load_vlm_results(path: Path) -> list[dict]:
