@@ -185,7 +185,9 @@ def process_channel(
     channel_frames_dir.mkdir(parents=True, exist_ok=True)
     events_path = OUT_DIR / f"{channel}_events.jsonl"
 
-    def make_record(second: int, kind: str, phash: imagehash.ImageHash, image_path: Path) -> dict:
+    def make_record(
+        second: int, kind: str, phash: imagehash.ImageHash, full_path: Path, crop_path: Path
+    ) -> dict:
         clock_dt = broadcast_start + timedelta(seconds=second)
         return {
             "channel": channel,
@@ -194,8 +196,17 @@ def process_channel(
             "clock_time": clock_dt.strftime("%H:%M:%S"),
             "minute_code": int(clock_dt.strftime("%H%M")),
             "phash": str(phash),
-            "image_path": str(image_path.relative_to(ROOT).as_posix()),
+            # image_path = 整張畫面（給 VLM 看上下文）；crop_path = headline_bar 裁切（給 VLM 看清楚文字）
+            "image_path": str(full_path.relative_to(ROOT).as_posix()),
+            "crop_path": str(crop_path.relative_to(ROOT).as_posix()),
         }
+
+    def save_pair(second: int, kind: str, frame: np.ndarray, crop: np.ndarray) -> tuple[Path, Path]:
+        full_path = channel_frames_dir / f"{kind}_{second:05d}.jpg"
+        crop_path = channel_frames_dir / f"{kind}_{second:05d}_crop.jpg"
+        cv2.imwrite(str(full_path), frame)
+        cv2.imwrite(str(crop_path), crop)
+        return full_path, crop_path
 
     series: list[tuple[int, imagehash.ImageHash]] = []
     frame_cache: dict[int, np.ndarray] = {}
@@ -210,9 +221,8 @@ def process_channel(
             frame_cache[second] = frame
 
             if second - last_heartbeat >= heartbeat_interval:
-                hb_path = channel_frames_dir / f"heartbeat_{second:05d}.jpg"
-                cv2.imwrite(str(hb_path), frame)
-                f.write(json.dumps(make_record(second, "heartbeat", phash, hb_path), ensure_ascii=False) + "\n")
+                full_path, crop_path = save_pair(second, "heartbeat", frame, crop)
+                f.write(json.dumps(make_record(second, "heartbeat", phash, full_path, crop_path), ensure_ascii=False) + "\n")
                 last_heartbeat = second
 
         events = detect_changes(series, threshold=threshold, stable_seconds=stable_seconds)
@@ -221,9 +231,8 @@ def process_channel(
             if event_frame is None:
                 continue
             crop = crop_roi(event_frame, headline_roi)
-            ev_path = channel_frames_dir / f"event_{second:05d}.jpg"
-            cv2.imwrite(str(ev_path), crop)
-            f.write(json.dumps(make_record(second, "event", phash, ev_path), ensure_ascii=False) + "\n")
+            full_path, crop_path = save_pair(second, "event", event_frame, crop)
+            f.write(json.dumps(make_record(second, "event", phash, full_path, crop_path), ensure_ascii=False) + "\n")
             event_count += 1
 
     print(f"[ok] {channel}: {event_count} 個事件, {len(series)} 秒已處理 -> {events_path.relative_to(ROOT)}")
