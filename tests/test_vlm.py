@@ -344,6 +344,70 @@ def test_query_image_pair_uses_cache_on_second_call(tmp_path, monkeypatch):
     assert first["result"]["main_title"] == second["result"]["main_title"] == "call-1"
 
 
+def test_format_progress_contains_rate_and_eta():
+    text = vlm.format_progress("ftv", done=100, total=400, elapsed_seconds=300)
+    assert "ftv" in text
+    assert "100/400" in text
+    assert "3.00" in text  # 秒/筆
+    # 300 remaining * 3s/item = 900s = 15.0 分
+    assert "15.0" in text
+
+
+def test_format_progress_zero_done_no_division_error():
+    text = vlm.format_progress("ftv", done=0, total=10, elapsed_seconds=0)
+    assert "0/10" in text
+
+
+def test_load_done_seconds_missing_file_returns_empty(tmp_path):
+    assert vlm.load_done_seconds(tmp_path / "nope.jsonl") == set()
+
+
+def test_load_done_seconds_reads_existing_records(tmp_path):
+    path = tmp_path / "out.jsonl"
+    path.write_text(
+        json.dumps({"video_second": 5}) + "\n" + json.dumps({"video_second": 10}) + "\n",
+        encoding="utf-8",
+    )
+    assert vlm.load_done_seconds(path) == {5, 10}
+
+
+def test_process_events_file_resumes_and_skips_done_seconds(tmp_path, monkeypatch):
+    monkeypatch.setattr(vlm, "ROOT", tmp_path)
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    events = []
+    for sec in [0, 1, 2]:
+        full_path = frames_dir / f"{sec}.jpg"
+        crop_path = frames_dir / f"{sec}_crop.jpg"
+        _write_test_image(full_path, color=(sec, sec, sec))
+        _write_test_image(crop_path, color=(sec, sec, sec))
+        events.append({
+            "type": "event", "video_second": sec, "clock_time": "12:00:00", "minute_code": 1200,
+            "image_path": str(full_path.relative_to(tmp_path).as_posix()),
+            "crop_path": str(crop_path.relative_to(tmp_path).as_posix()),
+        })
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+
+    out_path = tmp_path / "out.jsonl"
+    out_path.write_text(json.dumps({"video_second": 0, "result": {"screen_type": "news"}}) + "\n", encoding="utf-8")
+
+    calls = {"n": 0}
+
+    def fake_post(url, json, auth, timeout):
+        calls["n"] += 1
+        return FakeResponse(200, make_valid_body(title=f"call-{calls['n']}"))
+
+    monkeypatch.setattr(vlm.requests, "post", fake_post)
+    monkeypatch.setattr(vlm, "load_vlm_env", lambda: {"url": "http://fake", "user": "u", "password": "p", "model": "m"})
+
+    cache = vlm.ResultCache(tmp_path / "cache.jsonl")
+    counts = vlm.process_events_file(events_path, "ftv", cache, out_path)
+
+    assert counts["_skipped_resume"] == 1
+    assert calls["n"] == 2  # only seconds 1 and 2 actually called
+
+
 def test_query_image_pair_logs_timing(tmp_path, monkeypatch):
     full_path = tmp_path / "full.jpg"
     crop_path = tmp_path / "crop.jpg"

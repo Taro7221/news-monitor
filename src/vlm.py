@@ -495,6 +495,35 @@ def estimate_savings(events_path: Path) -> dict:
 
 # ---------- 批次處理 ----------
 
+PROGRESS_EVERY = 100
+
+
+def format_progress(channel: str, done: int, total: int, elapsed_seconds: float) -> str:
+    """每處理 N 筆印一次進度，依目前平均速度估剩餘時間。"""
+    rate = elapsed_seconds / done if done else 0.0
+    remaining = max(total - done, 0)
+    eta_seconds = remaining * rate
+    eta_min = eta_seconds / 60
+    return (
+        f"[progress] {channel}: {done}/{total} "
+        f"（{rate:.2f}秒/筆，已花 {elapsed_seconds/60:.1f} 分，預估剩餘 {eta_min:.1f} 分）"
+    )
+
+
+def load_done_seconds(out_path: Path) -> set:
+    """讀取已輸出的 jsonl，取出已經處理過的 video_second，供斷點續跑跳過用。"""
+    if not out_path.exists():
+        return set()
+    done = set()
+    for line in out_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        done.add(rec.get("video_second"))
+    return done
+
+
 def process_events_file(
     events_path: Path,
     channel: str,
@@ -504,6 +533,7 @@ def process_events_file(
     timeout: int = DEFAULT_TIMEOUT,
     max_retries: int = DEFAULT_MAX_RETRIES,
     limit: Optional[int] = None,
+    progress_every: int = PROGRESS_EVERY,
 ) -> dict:
     env = load_vlm_env()
     if not env["url"] or not env["model"]:
@@ -519,15 +549,28 @@ def process_events_file(
         records = records[:limit]
     decisions = plan_calls(records)
 
+    done_seconds = load_done_seconds(out_path)
+    total = len(records)
+    session_total = total - len(done_seconds)  # 這次執行還需要處理的筆數（扣掉斷點續跑已完成的）
+    if done_seconds:
+        print(f"[resume] {channel}: 偵測到 {out_path.name} 已有 {len(done_seconds)} 筆，將跳過已完成的部分")
+
     counts: dict[str, int] = {t: 0 for t in SCREEN_TYPES}
     counts["_error"] = 0
     counts["_reused"] = 0
+    counts["_skipped_resume"] = 0
     results_by_index: dict[int, dict] = {}
     processed = 0
+    start_time = time.perf_counter()
 
     with open(out_path, "a", encoding="utf-8") as fout:
         for decision, event in zip(decisions, records):
             i = decision["index"]
+
+            if event.get("video_second") in done_seconds:
+                counts["_skipped_resume"] += 1
+                continue
+
             full_path = ROOT / event["image_path"]
             crop_path = ROOT / event["crop_path"]
             meta = {
@@ -547,8 +590,11 @@ def process_events_file(
                     counts["_reused"] += 1
                     counts[record["result"]["screen_type"]] = counts.get(record["result"]["screen_type"], 0) + 1
                     fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    fout.flush()
                     results_by_index[i] = record
                     processed += 1
+                    if processed % progress_every == 0:
+                        print(format_progress(channel, processed, session_total, time.perf_counter() - start_time))
                     continue
                 # 找不到可沿用的結果（理論上不會發生），退回真的呼叫一次
 
@@ -560,12 +606,15 @@ def process_events_file(
                 screen_type = record["result"]["screen_type"]
                 counts[screen_type] = counts.get(screen_type, 0) + 1
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fout.flush()
                 results_by_index[i] = record
             except Exception as e:
                 counts["_error"] += 1
                 print(f"[error] {channel} second={event.get('video_second')}: {e}")
 
             processed += 1
+            if processed % progress_every == 0:
+                print(format_progress(channel, processed, session_total, time.perf_counter() - start_time))
 
     needs_call = sum(1 for d in decisions if d["needs_call"])
     print(
