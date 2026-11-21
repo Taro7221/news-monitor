@@ -1,0 +1,76 @@
+# ROI 校準設定：每台三個區塊的比例座標 (0~1)
+# x1,y1 = 左上角比例座標；x2,y2 = 右下角比例座標
+# 影片解析度請看 tools/check_env.py 的輸出；用比例座標可以不受解析度影響
+#   headline_bar: 主標題 bar（新聞標題/五字標顯示區）
+#   ticker       : 跑馬燈
+#   logo         : 台標
+# 這些是粗略預設值，請對照 out/calib/roi_preview.jpg 自行微調後重跑：
+#   python tools/calibrate.py --preview-only
+
+ftv:
+  headline_bar:
+    x1: 0.0
+    y1: 0.8
+    x2: 1.0
+    y2: 0.9
+  ticker:
+    x1: 0.0
+    y1: 0.92
+    x2: 1.0
+    y2: 0.98
+  logo:
+    x1: 0.02
+    y1: 0.03
+    x2: 0.15
+    y2: 0.12
+
+tvbs:
+  headline_bar:
+    x1: 0.0
+    y1: 0.8
+    x2: 1.0
+    y2: 0.9
+  ticker:
+    x1: 0.0
+    y1: 0.92
+    x2: 1.0
+    y2: 0.98
+  logo:
+    x1: 0.02
+    y1: 0.03
+    x2: 0.15
+    y2: 0.12
+
+ebc:
+  headline_bar:
+    x1: 0.0
+    y1: 0.8
+    x2: 1.0
+    y2: 0.9
+  ticker:
+    x1: 0.0
+    y1: 0.92
+    x2: 1.0
+    y2: 0.98
+  logo:
+    x1: 0.02
+    y1: 0.03
+    x2: 0.15
+    y2: 0.12
+
+cts:
+  headline_bar:
+    x1: 0.0
+    y1: 0.8
+    x2: 1.0
+    y2: 0.9
+  ticker:
+    x1: 0.0
+    y1: 0.92
+    x2: 1.0
+    y2: 0.98
+  logo:
+    x1: 0.02
+    y1: 0.03
+    x2: 0.15
+    y2: 0.12
