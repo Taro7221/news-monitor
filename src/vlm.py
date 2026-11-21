@@ -2,7 +2,7 @@
 
 對每一筆輸入（整張畫面 + headline_bar 裁切圖）送出一次請求，用 JSON schema
 強制回傳：
-    {screen_type, main_title, main_title_visible, confidence}
+    {screen_type: news|ad_wrap|full_ad|promo|other, main_title, main_title_visible, confidence}
 
 screen_type 五選一：
     news     - 正常新聞畫面，看得到主標題 bar
@@ -11,12 +11,25 @@ screen_type 五選一：
     promo    - 本台自家宣傳（節目預告、台呼等），不是新聞也不是外部廣告
     other    - 以上皆非（轉場、黑畫面等）
 
+效能優化（相對於第一版）：
+1. 計時拆解：每次呼叫記錄網路往返時間 + Ollama 回傳的
+   total_duration/load_duration/prompt_eval_*/eval_* 到 out/logs/vlm_timing.jsonl。
+2. 請求參數：think=false（關掉 gemma4 的思考模式）、num_ctx=4096、
+   num_predict=200、temperature=0，減少不必要的生成長度與思考開銷。
+3. 整張畫面縮到 768 寬、JPEG 品質 80；bar 裁切圖保留原解析度（讓 VLM 看清楚文字）。
+4. 本機先用 phash 做兩層過濾，沒變化就不送網路：
+   - 心跳幀：跟上一次「送過 VLM」的心跳整體雜湊差不多就沿用上次結果。
+   - 事件：跟上一次「送過 VLM」的事件 bar 雜湊幾乎相同（卡在 detect.py
+     門檻邊界的殘留重複）就沿用上次結果。
+5. 4 個頻道用 ThreadPoolExecutor 並行處理，共用同一份快取/計時紀錄（皆上鎖）。
+
 附重試／逾時／結果快取（同一張圖的內容雜湊不會重送）；快取寫在
 out/vlm_cache.jsonl，中斷後重跑會自動跳過已經問過的圖，達成斷點續跑。
 
 使用方式：
     python src/vlm.py --events out/ftv_events.jsonl --channel ftv
-    python src/vlm.py --channels ftv tvbs ebc cts   # 依序處理 out/{ch}_events.jsonl
+    python src/vlm.py --channels ftv tvbs ebc cts         # 4 台並行處理
+    python src/vlm.py --estimate-only                      # 只印本機去重後的筆數估計，不打網路
 """
 
 import argparse
@@ -25,9 +38,11 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -40,13 +55,29 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8")
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT_DIR = ROOT / "out"
-CACHE_PATH = OUT_DIR / "vlm_cache.jsonl"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import detect  # noqa: E402  (重用 compute_phash)
 
-DEFAULT_TIMEOUT = 180  # 秒；Colab 冷啟動 + CPU 推論可能偏慢
+OUT_DIR = ROOT / "out"
+LOGS_DIR = OUT_DIR / "logs"
+CACHE_PATH = OUT_DIR / "vlm_cache.jsonl"
+TIMING_PATH = LOGS_DIR / "vlm_timing.jsonl"
+
+DEFAULT_TIMEOUT = 180  # 秒；Colab 冷啟動 + CPU/GPU 推論可能偏慢
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_SECONDS = 2
-FULL_IMAGE_MAX_WIDTH = 1280
+
+FULL_IMAGE_MAX_WIDTH = 768
+FULL_IMAGE_JPEG_QUALITY = 80
+CROP_JPEG_QUALITY = 95  # 裁切圖保留原解析度+高品質，避免文字模糊
+
+DEFAULT_NUM_CTX = 4096
+DEFAULT_NUM_PREDICT = 200
+DEFAULT_TEMPERATURE = 0
+DEFAULT_THINK = False
+
+HEARTBEAT_REUSE_THRESHOLD = 10  # 心跳整體雜湊：差不多（<=10）就沿用上次結果
+EVENT_DEDUP_THRESHOLD = 20      # 事件 bar 雜湊：幾乎相同（<=20）才當重複跳過
 
 SCREEN_TYPES = ["news", "ad_wrap", "full_ad", "promo", "other"]
 
@@ -95,6 +126,8 @@ def load_vlm_env() -> dict:
     }
 
 
+# ---------- 圖片處理 ----------
+
 def resize_for_full(image_bgr: np.ndarray, max_width: int = FULL_IMAGE_MAX_WIDTH) -> np.ndarray:
     height, width = image_bgr.shape[:2]
     if width <= max_width:
@@ -103,15 +136,22 @@ def resize_for_full(image_bgr: np.ndarray, max_width: int = FULL_IMAGE_MAX_WIDTH
     return cv2.resize(image_bgr, (max_width, int(round(height * scale))))
 
 
-def image_to_base64(image_bgr: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".jpg", image_bgr)
+def image_to_base64(image_bgr: np.ndarray, quality: int = 95) -> str:
+    ok, buf = cv2.imencode(".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         raise ValueError("無法編碼圖片")
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def load_image_pair_base64(full_path: Path, crop_path: Path) -> tuple[str, str, bytes, bytes]:
-    """讀取整張畫面 + 裁切圖，整張畫面會縮到 FULL_IMAGE_MAX_WIDTH 寬。回傳
+def load_image_pair_base64(
+    full_path: Path,
+    crop_path: Path,
+    full_max_width: int = FULL_IMAGE_MAX_WIDTH,
+    full_quality: int = FULL_IMAGE_JPEG_QUALITY,
+    crop_quality: int = CROP_JPEG_QUALITY,
+) -> tuple[str, str, bytes, bytes]:
+    """讀取整張畫面 + 裁切圖。整張畫面縮到 full_max_width 寬、quality 壓縮；
+    裁切圖保留原解析度，只套用 crop_quality。回傳
     (full_b64, crop_b64, full_bytes_for_hash, crop_bytes_for_hash)。"""
     full_img = cv2.imread(str(full_path))
     crop_img = cv2.imread(str(crop_path))
@@ -120,9 +160,9 @@ def load_image_pair_base64(full_path: Path, crop_path: Path) -> tuple[str, str, 
     if crop_img is None:
         raise FileNotFoundError(f"讀不到裁切圖: {crop_path}")
 
-    full_img = resize_for_full(full_img)
-    full_b64 = image_to_base64(full_img)
-    crop_b64 = image_to_base64(crop_img)
+    full_img = resize_for_full(full_img, max_width=full_max_width)
+    full_b64 = image_to_base64(full_img, quality=full_quality)
+    crop_b64 = image_to_base64(crop_img, quality=crop_quality)
 
     full_bytes = full_path.read_bytes()
     crop_bytes = crop_path.read_bytes()
@@ -136,7 +176,17 @@ def compute_cache_key(full_bytes: bytes, crop_bytes: bytes) -> str:
     return h.hexdigest()
 
 
-def build_payload(model: str, full_b64: str, crop_b64: str) -> dict:
+# ---------- 請求 / 回應 ----------
+
+def build_payload(
+    model: str,
+    full_b64: str,
+    crop_b64: str,
+    think: bool = DEFAULT_THINK,
+    num_ctx: int = DEFAULT_NUM_CTX,
+    num_predict: int = DEFAULT_NUM_PREDICT,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> dict:
     return {
         "model": model,
         "messages": [
@@ -148,7 +198,12 @@ def build_payload(model: str, full_b64: str, crop_b64: str) -> dict:
         ],
         "format": RESPONSE_SCHEMA,
         "stream": False,
-        "options": {"temperature": 0},
+        **({"think": think} if think is not None else {}),
+        "options": {
+            "temperature": temperature,
+            **({"num_ctx": num_ctx} if num_ctx is not None else {}),
+            **({"num_predict": num_predict} if num_predict is not None else {}),
+        },
     }
 
 
@@ -187,19 +242,47 @@ def parse_response(raw_content: str) -> dict:
     }
 
 
-def call_vlm_once(env: dict, full_b64: str, crop_b64: str, timeout: int) -> dict:
-    payload = build_payload(env["model"], full_b64, crop_b64)
+def extract_timing(body: dict) -> dict:
+    """從 Ollama /api/chat 回應本體取出耗時欄位，奈秒轉成秒。"""
+    def ns_to_s(v):
+        return v / 1e9 if isinstance(v, (int, float)) else None
+
+    return {
+        "total_duration_s": ns_to_s(body.get("total_duration")),
+        "load_duration_s": ns_to_s(body.get("load_duration")),
+        "prompt_eval_count": body.get("prompt_eval_count"),
+        "prompt_eval_duration_s": ns_to_s(body.get("prompt_eval_duration")),
+        "eval_count": body.get("eval_count"),
+        "eval_duration_s": ns_to_s(body.get("eval_duration")),
+    }
+
+
+TIMING_NUMERIC_FIELDS = [
+    "wall_seconds", "total_duration_s", "load_duration_s",
+    "prompt_eval_count", "prompt_eval_duration_s",
+    "eval_count", "eval_duration_s",
+]
+
+
+def call_vlm_once(env: dict, full_b64: str, crop_b64: str, timeout: int, **payload_kwargs) -> tuple[dict, dict]:
+    payload = build_payload(env["model"], full_b64, crop_b64, **payload_kwargs)
     auth = HTTPBasicAuth(env["user"], env["password"]) if env["user"] else None
+    start = time.perf_counter()
     resp = requests.post(
         f"{env['url']}/api/chat",
         json=payload,
         auth=auth,
         timeout=timeout,
     )
+    wall_seconds = time.perf_counter() - start
     resp.raise_for_status()
     body = resp.json()
     content = body.get("message", {}).get("content", "")
-    return parse_response(content)
+    result = parse_response(content)
+
+    timing = {"wall_seconds": wall_seconds, "success": True, "error": None}
+    timing.update(extract_timing(body))
+    return result, timing
 
 
 def call_vlm_with_retries(
@@ -210,23 +293,42 @@ def call_vlm_with_retries(
     max_retries: int = DEFAULT_MAX_RETRIES,
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
     sleep_fn=time.sleep,
+    attempts_out: Optional[list] = None,
+    **payload_kwargs,
 ) -> dict:
+    """attempts_out（若提供）會被附加每一次嘗試的計時紀錄，不論最後成功或失敗。"""
     last_exc: Optional[Exception] = None
     for attempt in range(max_retries):
+        start = time.perf_counter()
         try:
-            return call_vlm_once(env, full_b64, crop_b64, timeout)
+            result, timing = call_vlm_once(env, full_b64, crop_b64, timeout, **payload_kwargs)
+            timing["attempt"] = attempt + 1
+            if attempts_out is not None:
+                attempts_out.append(timing)
+            return result
         except (requests.exceptions.RequestException, VLMResponseError) as e:
+            wall_seconds = time.perf_counter() - start
+            if attempts_out is not None:
+                attempts_out.append({
+                    "attempt": attempt + 1,
+                    "wall_seconds": wall_seconds,
+                    "success": False,
+                    "error": repr(e),
+                })
             last_exc = e
             if attempt < max_retries - 1:
                 sleep_fn(backoff_seconds * (2 ** attempt))
     raise RuntimeError(f"VLM 呼叫失敗，重試 {max_retries} 次仍失敗: {last_exc!r}") from last_exc
 
 
+# ---------- 快取 / 計時紀錄（皆執行緒安全） ----------
+
 class ResultCache:
     """用內容雜湊當 key 的結果快取，持久化成 jsonl，支援斷點續跑。"""
 
     def __init__(self, path: Path):
         self.path = path
+        self._lock = threading.Lock()
         self.data: dict[str, dict] = {}
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
@@ -238,13 +340,41 @@ class ResultCache:
                     self.data[record["key"]] = record
 
     def get(self, key: str) -> Optional[dict]:
-        return self.data.get(key)
+        with self._lock:
+            return self.data.get(key)
 
     def put(self, record: dict) -> None:
-        self.data[record["key"]] = record
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with self._lock:
+            self.data[record["key"]] = record
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+class TimingRecorder:
+    """記錄每次實際網路呼叫的耗時拆解，持久化成 jsonl，可印平均值。"""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+        self.records: list[dict] = []
+
+    def record(self, rec: dict) -> None:
+        with self._lock:
+            self.records.append(rec)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def summary(self) -> dict:
+        with self._lock:
+            records = list(self.records)
+        successes = [r for r in records if r.get("success")]
+        out: dict = {"n": len(successes), "n_failed": len(records) - len(successes)}
+        for field in TIMING_NUMERIC_FIELDS:
+            vals = [r[field] for r in successes if r.get(field) is not None]
+            out[field] = sum(vals) / len(vals) if vals else None
+        return out
 
 
 def query_image_pair(
@@ -252,10 +382,12 @@ def query_image_pair(
     crop_path: Path,
     env: dict,
     cache: ResultCache,
+    timing: Optional[TimingRecorder] = None,
     extra_meta: Optional[dict] = None,
     timeout: int = DEFAULT_TIMEOUT,
     max_retries: int = DEFAULT_MAX_RETRIES,
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
+    **payload_kwargs,
 ) -> dict:
     """查一組（整張畫面, 裁切圖），先查快取，沒有才真的呼叫 VLM 並寫入快取。"""
     full_b64, crop_b64, full_bytes, crop_bytes = load_image_pair_base64(full_path, crop_path)
@@ -265,10 +397,22 @@ def query_image_pair(
     if cached is not None:
         return cached
 
-    result = call_vlm_with_retries(
-        env, full_b64, crop_b64,
-        timeout=timeout, max_retries=max_retries, backoff_seconds=backoff_seconds,
-    )
+    attempts: list[dict] = []
+    try:
+        result = call_vlm_with_retries(
+            env, full_b64, crop_b64,
+            timeout=timeout, max_retries=max_retries, backoff_seconds=backoff_seconds,
+            attempts_out=attempts, **payload_kwargs,
+        )
+        return_record = True
+    finally:
+        if timing is not None:
+            for a in attempts:
+                rec = dict(a)
+                if extra_meta:
+                    rec.update(extra_meta)
+                timing.record(rec)
+
     record = {
         "key": key,
         "image_path": str(full_path.relative_to(ROOT).as_posix()) if full_path.is_relative_to(ROOT) else str(full_path),
@@ -281,11 +425,82 @@ def query_image_pair(
     return record
 
 
+# ---------- 本機去重（不打網路） ----------
+
+def is_similar(hash_a, hash_b, threshold: int, diff: Callable = lambda a, b: a - b) -> bool:
+    if hash_a is None or hash_b is None:
+        return False
+    return diff(hash_a, hash_b) <= threshold
+
+
+def get_dedup_phash(record: dict) -> "object":
+    """心跳用整張畫面的雜湊（整體版面），事件用 bar 裁切圖的雜湊。"""
+    path = record["image_path"] if record["type"] == "heartbeat" else record["crop_path"]
+    img = cv2.imread(str(ROOT / path) if not Path(path).is_absolute() else path)
+    if img is None:
+        return None
+    return detect.compute_phash(img)
+
+
+def plan_calls(
+    records: list[dict],
+    get_phash: Callable[[dict], object] = get_dedup_phash,
+    heartbeat_threshold: int = HEARTBEAT_REUSE_THRESHOLD,
+    event_threshold: int = EVENT_DEDUP_THRESHOLD,
+) -> list[dict]:
+    """依序走過 records，決定每一筆是否真的需要呼叫 VLM（needs_call），
+    或可以沿用同一條鏈（heartbeat / event）裡上一次「有呼叫」的結果（reused_index）。
+    純邏輯：不碰網路，get_phash 可注入以利測試。"""
+    decisions: list[dict] = []
+    last_heartbeat_hash = None
+    last_heartbeat_call_index: Optional[int] = None
+    last_event_hash = None
+    last_event_call_index: Optional[int] = None
+
+    for i, rec in enumerate(records):
+        kind = rec.get("type")
+        h = get_phash(rec)
+
+        if kind == "heartbeat":
+            reuse = is_similar(h, last_heartbeat_hash, heartbeat_threshold)
+            if reuse:
+                decisions.append({"index": i, "needs_call": False, "reused_index": last_heartbeat_call_index})
+            else:
+                decisions.append({"index": i, "needs_call": True, "reused_index": None})
+                last_heartbeat_hash = h
+                last_heartbeat_call_index = i
+        elif kind == "event":
+            reuse = is_similar(h, last_event_hash, event_threshold)
+            if reuse:
+                decisions.append({"index": i, "needs_call": False, "reused_index": last_event_call_index})
+            else:
+                decisions.append({"index": i, "needs_call": True, "reused_index": None})
+                last_event_hash = h
+                last_event_call_index = i
+        else:
+            decisions.append({"index": i, "needs_call": True, "reused_index": None})
+
+    return decisions
+
+
+def estimate_savings(events_path: Path) -> dict:
+    """純本機估計（不打網路）：讀 events jsonl，回傳 {total, needs_call, reused}。"""
+    if not events_path.exists():
+        return {"total": 0, "needs_call": 0, "reused": 0}
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    decisions = plan_calls(records)
+    needs_call = sum(1 for d in decisions if d["needs_call"])
+    return {"total": len(records), "needs_call": needs_call, "reused": len(records) - needs_call}
+
+
+# ---------- 批次處理 ----------
+
 def process_events_file(
     events_path: Path,
     channel: str,
     cache: ResultCache,
     out_path: Path,
+    timing: Optional[TimingRecorder] = None,
     timeout: int = DEFAULT_TIMEOUT,
     max_retries: int = DEFAULT_MAX_RETRIES,
     limit: Optional[int] = None,
@@ -299,43 +514,63 @@ def process_events_file(
         print(f"[skip] {events_path} 不存在")
         return {}
 
+    records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if limit is not None:
+        records = records[:limit]
+    decisions = plan_calls(records)
+
     counts: dict[str, int] = {t: 0 for t in SCREEN_TYPES}
     counts["_error"] = 0
+    counts["_reused"] = 0
+    results_by_index: dict[int, dict] = {}
     processed = 0
 
-    with open(events_path, "r", encoding="utf-8") as fin, open(out_path, "a", encoding="utf-8") as fout:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            if limit is not None and processed >= limit:
-                break
-            event = json.loads(line)
+    with open(out_path, "a", encoding="utf-8") as fout:
+        for decision, event in zip(decisions, records):
+            i = decision["index"]
             full_path = ROOT / event["image_path"]
             crop_path = ROOT / event["crop_path"]
+            meta = {
+                "channel": channel,
+                "type": event.get("type"),
+                "video_second": event.get("video_second"),
+                "clock_time": event.get("clock_time"),
+                "minute_code": event.get("minute_code"),
+            }
+
+            if not decision["needs_call"]:
+                reused = results_by_index.get(decision["reused_index"])
+                if reused is not None:
+                    record = dict(reused)
+                    record.update(meta)
+                    record["reused_from_second"] = reused.get("video_second")
+                    counts["_reused"] += 1
+                    counts[record["result"]["screen_type"]] = counts.get(record["result"]["screen_type"], 0) + 1
+                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    results_by_index[i] = record
+                    processed += 1
+                    continue
+                # 找不到可沿用的結果（理論上不會發生），退回真的呼叫一次
 
             try:
                 record = query_image_pair(
-                    full_path, crop_path, env, cache,
-                    extra_meta={
-                        "channel": channel,
-                        "type": event.get("type"),
-                        "video_second": event.get("video_second"),
-                        "clock_time": event.get("clock_time"),
-                        "minute_code": event.get("minute_code"),
-                    },
-                    timeout=timeout, max_retries=max_retries,
+                    full_path, crop_path, env, cache, timing=timing,
+                    extra_meta=meta, timeout=timeout, max_retries=max_retries,
                 )
                 screen_type = record["result"]["screen_type"]
                 counts[screen_type] = counts.get(screen_type, 0) + 1
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                results_by_index[i] = record
             except Exception as e:
                 counts["_error"] += 1
                 print(f"[error] {channel} second={event.get('video_second')}: {e}")
 
             processed += 1
 
-    print(f"[ok] {channel}: 處理 {processed} 筆, 統計 {counts}")
+    needs_call = sum(1 for d in decisions if d["needs_call"])
+    print(
+        f"[ok] {channel}: 處理 {processed} 筆（本機去重後實際呼叫 {needs_call}/{len(records)}）, 統計 {counts}"
+    )
     return counts
 
 
@@ -347,27 +582,51 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--limit", type=int, default=None, help="只處理前 N 筆（除錯用）")
+    parser.add_argument("--workers", type=int, default=4, help="並行處理的頻道數")
+    parser.add_argument("--estimate-only", action="store_true", help="只印本機去重後的筆數估計，不打網路")
     args = parser.parse_args()
-
-    cache = ResultCache(CACHE_PATH)
 
     if args.events and args.channel:
         jobs = [(args.channel, Path(args.events))]
     else:
         jobs = [(ch, OUT_DIR / f"{ch}_events.jsonl") for ch in args.channels]
 
+    if args.estimate_only:
+        print("=== 本機去重估計（不打網路） ===")
+        for channel, events_path in jobs:
+            est = estimate_savings(events_path)
+            print(f"{channel}: 原本 {est['total']} 筆 -> 實際需呼叫 {est['needs_call']} 筆（省下 {est['reused']} 筆）")
+        return 0
+
+    cache = ResultCache(CACHE_PATH)
+    timing = TimingRecorder(TIMING_PATH)
+
     summary = {}
-    for channel, events_path in jobs:
+
+    def run_job(channel, events_path):
         out_path = OUT_DIR / f"{channel}_vlm.jsonl"
-        counts = process_events_file(
-            events_path, channel, cache, out_path,
+        return channel, process_events_file(
+            events_path, channel, cache, out_path, timing=timing,
             timeout=args.timeout, max_retries=args.max_retries, limit=args.limit,
         )
-        summary[channel] = counts
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = [pool.submit(run_job, ch, path) for ch, path in jobs]
+        for future in as_completed(futures):
+            channel, counts = future.result()
+            summary[channel] = counts
 
     print("\n=== screen_type 統計 ===")
-    for channel, counts in summary.items():
-        print(f"{channel}: {counts}")
+    for channel in [ch for ch, _ in jobs]:
+        print(f"{channel}: {summary.get(channel)}")
+
+    ts = timing.summary()
+    if ts.get("n"):
+        print("\n=== VLM 呼叫耗時平均（本次執行） ===")
+        print(f"樣本數: {ts['n']}（失敗 {ts['n_failed']}）")
+        for field in TIMING_NUMERIC_FIELDS:
+            val = ts.get(field)
+            print(f"  {field}: {val:.3f}" if val is not None else f"  {field}: N/A")
 
     return 0
 
