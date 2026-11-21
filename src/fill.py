@@ -121,7 +121,11 @@ def consolidate_same_minute_events(
             elif score <= low_threshold:
                 same = False
             elif vlm_judge_fn is not None:
-                same = vlm_judge_fn(rep["label"], ev["label"])
+                try:
+                    same = vlm_judge_fn(rep["label"], ev["label"])
+                except Exception:
+                    # 判斷失敗就保守當作不同則，不要讓單一次呼叫失敗拖垮整批
+                    same = False
             else:
                 same = False
             if same:

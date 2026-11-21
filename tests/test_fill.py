@@ -142,6 +142,22 @@ def test_consolidate_same_minute_events_ambiguous_uses_vlm_judge():
     assert len(split) == 2
 
 
+def test_consolidate_same_minute_events_vlm_judge_exception_degrades_to_different():
+    def fake_similarity(a, b):
+        return 70.0  # 介於門檻之間
+
+    def failing_judge(a, b):
+        raise RuntimeError("VLM 呼叫失敗，重試 3 次仍失敗")
+
+    events = [
+        {"kind": "news", "label": "標題A", "confidence": 0.9, "video_second": 300},
+        {"kind": "news", "label": "標題B", "confidence": 0.9, "video_second": 320},
+    ]
+    # 不應該讓例外往外丟崩潰，應該保守當作不同則
+    result = fill.consolidate_same_minute_events(events, vlm_judge_fn=failing_judge, similarity_fn=fake_similarity)
+    assert len(result) == 2
+
+
 def test_consolidate_same_minute_events_preserves_chronological_order():
     events = [
         {"kind": "news", "label": "乙新聞", "confidence": 0.9, "video_second": 320},

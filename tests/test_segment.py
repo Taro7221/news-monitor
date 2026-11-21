@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -187,6 +188,23 @@ def test_merge_continuations_empty_input():
     assert segment.merge_continuations([]) == []
 
 
+def test_merge_continuations_vlm_judge_exception_degrades_to_ambiguous_flag():
+    def fake_similarity(a, b):
+        return 70.0  # 介於門檻之間，會呼叫 vlm_judge_fn
+
+    def failing_judge(a, b):
+        raise RuntimeError("VLM 呼叫失敗，重試 3 次仍失敗")
+
+    events = [
+        {"video_second": 0, "title": "標題A", "confidence": 0.9},
+        {"video_second": 5, "title": "標題B", "confidence": 0.9},
+    ]
+    # 不應該讓例外往外丟，應該保守當作換則並標記 ambiguous_next
+    segments = segment.merge_continuations(events, similarity_fn=fake_similarity, vlm_judge_fn=failing_judge)
+    assert len(segments) == 2
+    assert segments[0]["ambiguous_next"] is not None
+
+
 def test_merge_continuations_representative_title_is_majority_variant():
     events = [
         {"video_second": 0, "title": "汽油彈襲警車罪加一等", "confidence": 0.9},
@@ -264,6 +282,31 @@ def test_generate_five_char_label_retries_then_succeeds():
     assert result["attempts"][0]["violations"]
 
 
+def test_generate_five_char_label_vlm_fn_exception_does_not_crash_falls_back():
+    def always_raises(title, attempt, prev_violations):
+        raise RuntimeError("VLM 呼叫失敗，重試 3 次仍失敗")
+
+    result = segment.generate_five_char_label("台北市發生車禍", always_raises, max_retries=2)
+    assert result["fallback_used"] is True
+    assert len(result["label"]) == 5
+    assert len(result["attempts"]) == 3
+    assert all("VLM 呼叫例外" in a["violations"][0] for a in result["attempts"])
+
+
+def test_generate_five_char_label_recovers_after_one_exception():
+    calls = {"n": 0}
+
+    def flaky(title, attempt, prev_violations):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient")
+        return "台北車禍案"
+
+    result = segment.generate_five_char_label("台北市發生車禍", flaky)
+    assert result["fallback_used"] is False
+    assert result["label"] == "台北車禍案"
+
+
 def test_generate_five_char_label_falls_back_after_exhausting_retries():
     def vlm_fn(title, attempt, prev_violations):
         return "太短"  # 永遠不合格
@@ -300,6 +343,78 @@ def test_parse_judge_response_different():
 def test_parse_judge_response_ambiguous_defaults_false():
     assert segment.parse_judge_response("I'm not sure") is False
     assert segment.parse_judge_response("") is False
+
+
+# ---------- 純文字 VLM 呼叫的連線韌性 ----------
+
+def test_resilient_text_call_succeeds_first_try():
+    calls = []
+
+    def make_request(env):
+        calls.append(env["url"])
+        return "ok"
+
+    result = segment._resilient_text_call(make_request, {"url": "http://fake"}, sleep_fn=lambda s: None)
+    assert result == "ok"
+    assert calls == ["http://fake"]
+
+
+def test_resilient_text_call_connection_error_waits_and_reloads_env(monkeypatch):
+    attempts = []
+
+    def make_request(env):
+        attempts.append(env["url"])
+        if env["url"] == "http://old":
+            raise requests.exceptions.ConnectionError("down")
+        return "ok"
+
+    wait_calls = []
+    monkeypatch.setattr(segment.vlm, "load_vlm_env", lambda: {"url": "http://new"})
+
+    result = segment._resilient_text_call(
+        make_request, {"url": "http://old"},
+        wait_fn=wait_calls.append, sleep_fn=lambda s: None,
+    )
+    assert result == "ok"
+    assert attempts == ["http://old", "http://new"]
+    assert len(wait_calls) == 1
+
+
+def test_resilient_text_call_non_connection_error_retries_then_raises():
+    def make_request(env):
+        raise ValueError("bad response")
+
+    with pytest.raises(RuntimeError):
+        segment._resilient_text_call(
+            make_request, {"url": "http://fake"}, max_retries=2, sleep_fn=lambda s: None,
+        )
+
+
+def test_call_vlm_for_label_uses_resilient_call(monkeypatch):
+    captured = {}
+
+    def fake_resilient(make_request, env, **kwargs):
+        captured["env"] = env
+        return make_request(env)
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"message": {"content": "台北車禍案"}}
+
+    def fake_post(url, json, auth, timeout):
+        captured["url"] = url
+        return FakeResp()
+
+    monkeypatch.setattr(segment, "_resilient_text_call", fake_resilient)
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    env = {"url": "http://fake", "user": "", "password": "", "model": "m"}
+    result = segment.call_vlm_for_label("台北市發生車禍", 0, None, env)
+    assert result == "台北車禍案"
+    assert captured["url"] == "http://fake/api/chat"
 
 
 # ---------- 整合：load_vlm_results / build_segments_for_channel ----------

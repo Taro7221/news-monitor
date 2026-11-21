@@ -26,6 +26,7 @@ main_title, main_title_visible, confidence}}）：
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -36,6 +37,9 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8")
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import vlm  # noqa: E402  (重用連線類例外分類 + 健康檢查等待，讓文字 VLM 呼叫也扛得住斷線)
+
 OUT_DIR = ROOT / "out"
 LOW_CONF_LOG_PATH = OUT_DIR / "low_conf.jsonl"
 
@@ -247,7 +251,15 @@ def merge_continuations(
         elif score <= low_threshold:
             same = False
         elif vlm_judge_fn is not None:
-            same = vlm_judge_fn(last_title, ev["title"])
+            try:
+                same = vlm_judge_fn(last_title, ev["title"])
+            except Exception:
+                # vlm_judge_fn 自己的重試／健康檢查等待已經用盡才會走到這裡；
+                # 保守當作換則並標記待覆核，不要讓單一次判斷失敗拖垮整批
+                same = False
+                current["ambiguous_next"] = {
+                    "other_title": ev["title"], "other_second": ev["video_second"], "score": score,
+                }
         else:
             same = False
             current["ambiguous_next"] = {
@@ -344,7 +356,13 @@ def generate_five_char_label(
     attempts = []
     for attempt in range(max_retries + 1):
         previous_violations = attempts[-1]["violations"] if attempts else None
-        label = vlm_text_fn(title, attempt, previous_violations)
+        try:
+            label = vlm_text_fn(title, attempt, previous_violations)
+        except Exception as e:
+            # vlm_text_fn 自己的重試／健康檢查等待已經用盡才會走到這裡；不要讓
+            # 單一則新聞的呼叫失敗拖垮整批，當作這次嘗試不合格，繼續重試/退回關鍵字擷取
+            attempts.append({"label": None, "violations": [f"VLM 呼叫例外：{e!r}"]})
+            continue
         violations = validate_five_char_label(label, title)
         attempts.append({"label": label, "violations": violations})
         if not violations:
@@ -366,6 +384,39 @@ LABEL_PROMPT_TEMPLATE = """你是新聞監看五字標產生器。根據下面�
 只回傳五字標本身，不要加任何說明文字。"""
 
 
+TEXT_CALL_MAX_RETRIES = 3
+TEXT_CALL_BACKOFF_SECONDS = 2.0
+
+
+def _resilient_text_call(
+    make_request: Callable[[dict], object],
+    env: dict,
+    max_retries: int = TEXT_CALL_MAX_RETRIES,
+    backoff_seconds: float = TEXT_CALL_BACKOFF_SECONDS,
+    wait_fn: Callable[[dict], None] = vlm.wait_until_healthy,
+    sleep_fn=time.sleep,
+) -> object:
+    """包一層重試／健康檢查等待，給純文字 VLM 呼叫用，避免暫時性斷線
+    （ngrok 重啟之類）直接讓呼叫端整個崩潰：
+    - 連線類例外（連不到伺服器）：卡住等健康檢查恢復、重新讀 .env，然後重打。
+    - 其他例外（伺服器回應但內容有問題）：簡單重試幾次，仍失敗才真的往外丟。
+    make_request(current_env) 要自己組 payload、送出請求、回傳解析後的結果。"""
+    current_env = env
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            return make_request(current_env)
+        except vlm.CONNECTION_EXCEPTIONS as e:
+            last_exc = e
+            wait_fn(current_env)
+            current_env = vlm.load_vlm_env()  # .env 可能被更新了，重新讀取再繼續
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                sleep_fn(backoff_seconds * (2 ** attempt))
+    raise RuntimeError(f"文字 VLM 呼叫失敗，重試 {max_retries} 次仍失敗: {last_exc!r}") from last_exc
+
+
 def call_vlm_for_label(
     title: str,
     attempt: int,
@@ -377,27 +428,30 @@ def call_vlm_for_label(
     """真正會打網路的純文字 VLM 呼叫（給 generate_five_char_label 當 vlm_text_fn 用）。
     這裡只是把介面寫好、放進模組裡方便 import，實際要不要呼叫由上層決定——
     全量批次還在跑、要保留 GPU 資源給它時，不要在這裡接上這個函式。"""
-    import requests
-    from requests.auth import HTTPBasicAuth
-
     retry_note = ""
     if previous_violations:
         retry_note = f"（上一次產生的結果不合格，原因：{'; '.join(previous_violations)}，請修正）\n"
     prompt = LABEL_PROMPT_TEMPLATE.format(title=title, retry_note=retry_note)
 
-    payload = {
-        "model": model or env.get("model"),
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "think": False,
-        "options": {"temperature": 0, "num_predict": 30},
-    }
-    auth = HTTPBasicAuth(env["user"], env["password"]) if env.get("user") else None
-    resp = requests.post(f"{env['url']}/api/chat", json=payload, auth=auth, timeout=timeout)
-    resp.raise_for_status()
-    body = resp.json()
-    content = body.get("message", {}).get("content", "")
-    return content.strip()
+    def make_request(current_env: dict) -> str:
+        import requests
+        from requests.auth import HTTPBasicAuth
+
+        payload = {
+            "model": model or current_env.get("model"),
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0, "num_predict": 30},
+        }
+        auth = HTTPBasicAuth(current_env["user"], current_env["password"]) if current_env.get("user") else None
+        resp = requests.post(f"{current_env['url']}/api/chat", json=payload, auth=auth, timeout=timeout)
+        resp.raise_for_status()
+        body = resp.json()
+        content = body.get("message", {}).get("content", "")
+        return content.strip()
+
+    return _resilient_text_call(make_request, env)
 
 
 JUDGE_PROMPT_TEMPLATE = """你是新聞監看助手。下面兩個「標題讀值」是從同一台新聞畫面上不同時間點的
@@ -434,23 +488,27 @@ def call_vlm_judge_same_story(
 ) -> bool:
     """真正會打網路的純文字 VLM 呼叫，判斷兩個標題讀值是不是同一則新聞
     （給 merge_continuations 當 vlm_judge_fn 用）。"""
-    import requests
-    from requests.auth import HTTPBasicAuth
-
     prompt = JUDGE_PROMPT_TEMPLATE.format(title_a=title_a, title_b=title_b)
-    payload = {
-        "model": model or env.get("model"),
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "think": False,
-        "options": {"temperature": 0, "num_predict": 10},
-    }
-    auth = HTTPBasicAuth(env["user"], env["password"]) if env.get("user") else None
-    resp = requests.post(f"{env['url']}/api/chat", json=payload, auth=auth, timeout=timeout)
-    resp.raise_for_status()
-    body = resp.json()
-    content = body.get("message", {}).get("content", "")
-    return parse_judge_response(content)
+
+    def make_request(current_env: dict) -> bool:
+        import requests
+        from requests.auth import HTTPBasicAuth
+
+        payload = {
+            "model": model or current_env.get("model"),
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0, "num_predict": 10},
+        }
+        auth = HTTPBasicAuth(current_env["user"], current_env["password"]) if current_env.get("user") else None
+        resp = requests.post(f"{current_env['url']}/api/chat", json=payload, auth=auth, timeout=timeout)
+        resp.raise_for_status()
+        body = resp.json()
+        content = body.get("message", {}).get("content", "")
+        return parse_judge_response(content)
+
+    return _resilient_text_call(make_request, env)
 
 
 # ---------- 整合：單一頻道的分段流程（本機、不呼叫任何 VLM） ----------
