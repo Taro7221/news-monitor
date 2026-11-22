@@ -14,12 +14,29 @@ from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
+from werkzeug.exceptions import HTTPException
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jobs  # noqa: E402
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024  # 2GB，整小時側錄通常幾百MB~1GB
+# 整小時的側錄畫質好的話可能好幾 GB，2GB 太容易被擋下來；這裡放寬到 20GB
+# （本機 demo、信任來源，不用像公開服務那樣嚴格限制上傳大小）。
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e: HTTPException):
+    """預設的 Flask 錯誤頁是 HTML，前端 JS 用 resp.json() 解析會直接丟出
+    「Unexpected token '<'...」這種看不懂的錯誤（例如上傳檔案超過大小限制
+    觸發的 413）。這裡統一改成回傳 JSON，前端才看得懂、顯示得出真正原因。"""
+    return jsonify({"error": e.description or e.name}), e.code
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_exception(e: Exception):
+    app.logger.exception("未預期的例外")
+    return jsonify({"error": f"伺服器發生未預期的錯誤：{e!r}"}), 500
 
 
 @app.route("/")

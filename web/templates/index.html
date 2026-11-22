@@ -85,6 +85,19 @@ const CHANNEL_LABELS = {{ labels | tojson }};
 let currentJobId = null;
 let pollTimer = null;
 
+// 伺服器理論上任何錯誤都會回傳 JSON（見 web/app.py 的 errorhandler），但這裡
+// 還是做一層防呆：萬一遇到伺服器真的回了非 JSON 的內容（例如反向代理自己
+// 產生的錯誤頁），也不要讓 resp.json() 直接丟出看不懂的解析錯誤，而是顯示
+// 看得懂的「HTTP 狀態碼 + 內容開頭」。
+async function safeJson(resp) {
+  const contentType = resp.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    const text = await resp.text();
+    throw new Error(`伺服器回應非預期格式（HTTP ${resp.status}）：${text.slice(0, 200)}`);
+  }
+  return resp.json();
+}
+
 document.getElementById("upload-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = e.target;
@@ -97,7 +110,7 @@ document.getElementById("upload-form").addEventListener("submit", async (e) => {
 
   try {
     const resp = await fetch("/api/upload", { method: "POST", body: data });
-    const body = await resp.json();
+    const body = await safeJson(resp);
     if (!resp.ok) {
       throw new Error(body.error || "上傳失敗");
     }
@@ -127,9 +140,20 @@ function startPolling() {
 
 async function refreshStatus() {
   if (!currentJobId) return;
-  const resp = await fetch(`/api/jobs/${currentJobId}/status`);
-  if (!resp.ok) return;
-  const data = await resp.json();
+  const errorBox = document.getElementById("error-box");
+  let data;
+  try {
+    const resp = await fetch(`/api/jobs/${currentJobId}/status`);
+    data = await safeJson(resp);
+    if (!resp.ok) {
+      throw new Error(data.error || `查詢進度失敗（HTTP ${resp.status}）`);
+    }
+  } catch (err) {
+    errorBox.textContent = "錯誤：" + err.message;
+    errorBox.style.display = "block";
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    return;
+  }
 
   const tbody = document.getElementById("status-body");
   tbody.innerHTML = "";

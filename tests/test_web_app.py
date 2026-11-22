@@ -67,6 +67,20 @@ def test_upload_single_channel_creates_job_and_queues_only_that_channel(client):
 def test_status_endpoint_for_unknown_job_is_404(client):
     resp = client.get("/api/jobs/doesnotexist/status")
     assert resp.status_code == 404
+    # 回歸測試：404/413 這類 HTTP 錯誤以前會回傳 Flask 預設的 HTML 錯誤頁，
+    # 前端 JS 用 resp.json() 解析 HTML 會直接丟出「Unexpected token '<'」這種
+    # 看不懂的錯誤（實際發生過：上傳檔案超過大小限制觸發 413 時）。
+    assert resp.content_type.startswith("application/json")
+    assert "error" in resp.get_json()
+
+
+def test_oversized_upload_returns_json_not_html(client, monkeypatch):
+    monkeypatch.setitem(web_app.app.config, "MAX_CONTENT_LENGTH", 100)
+    data = {"date": "2026-11-06", "ftv": (io.BytesIO(b"x" * 5000), "ftv.mp4")}
+    resp = client.post("/api/upload", data=data, content_type="multipart/form-data")
+    assert resp.status_code == 413
+    assert resp.content_type.startswith("application/json")
+    assert "error" in resp.get_json()
 
 
 def test_download_before_anything_done_returns_409(client):
