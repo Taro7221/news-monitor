@@ -339,6 +339,7 @@ def test_query_image_pair_uses_cache_on_second_call(tmp_path, monkeypatch):
 
     first = vlm.query_image_pair(full_path, crop_path, env, cache)
     second = vlm.query_image_pair(full_path, crop_path, env, cache)
+    assert first["prompt_version"] == vlm.PROMPT_VERSION
 
     assert calls["n"] == 1
     assert first["result"]["main_title"] == second["result"]["main_title"] == "call-1"
@@ -362,13 +363,31 @@ def test_load_done_seconds_missing_file_returns_empty(tmp_path):
     assert vlm.load_done_seconds(tmp_path / "nope.jsonl") == set()
 
 
-def test_load_done_seconds_reads_existing_records(tmp_path):
+def test_load_done_seconds_reads_existing_records_matching_prompt_version(tmp_path):
     path = tmp_path / "out.jsonl"
     path.write_text(
-        json.dumps({"video_second": 5}) + "\n" + json.dumps({"video_second": 10}) + "\n",
+        json.dumps({"video_second": 5, "prompt_version": vlm.PROMPT_VERSION}) + "\n"
+        + json.dumps({"video_second": 10, "prompt_version": vlm.PROMPT_VERSION}) + "\n",
         encoding="utf-8",
     )
     assert vlm.load_done_seconds(path) == {5, 10}
+
+
+def test_load_done_seconds_ignores_records_with_stale_or_missing_prompt_version(tmp_path):
+    path = tmp_path / "out.jsonl"
+    path.write_text(
+        json.dumps({"video_second": 5, "prompt_version": vlm.PROMPT_VERSION - 1}) + "\n"
+        + json.dumps({"video_second": 10}) + "\n"  # 舊資料根本沒有這個欄位
+        + json.dumps({"video_second": 20, "prompt_version": vlm.PROMPT_VERSION}) + "\n",
+        encoding="utf-8",
+    )
+    assert vlm.load_done_seconds(path) == {20}
+
+
+def test_load_done_seconds_version_check_can_be_disabled(tmp_path):
+    path = tmp_path / "out.jsonl"
+    path.write_text(json.dumps({"video_second": 5}) + "\n", encoding="utf-8")
+    assert vlm.load_done_seconds(path, required_prompt_version=None) == {5}
 
 
 def test_process_events_file_resumes_and_skips_done_seconds(tmp_path, monkeypatch):
@@ -390,7 +409,10 @@ def test_process_events_file_resumes_and_skips_done_seconds(tmp_path, monkeypatc
     events_path.write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
 
     out_path = tmp_path / "out.jsonl"
-    out_path.write_text(json.dumps({"video_second": 0, "result": {"screen_type": "news"}}) + "\n", encoding="utf-8")
+    out_path.write_text(
+        json.dumps({"video_second": 0, "result": {"screen_type": "news"}, "prompt_version": vlm.PROMPT_VERSION}) + "\n",
+        encoding="utf-8",
+    )
 
     calls = {"n": 0}
 

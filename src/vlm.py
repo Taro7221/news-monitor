@@ -600,6 +600,7 @@ def query_image_pair(
         "image_path": str(full_path.relative_to(ROOT).as_posix()) if full_path.is_relative_to(ROOT) else str(full_path),
         "crop_path": str(crop_path.relative_to(ROOT).as_posix()) if crop_path.is_relative_to(ROOT) else str(crop_path),
         "result": result,
+        "prompt_version": PROMPT_VERSION,
     }
     if degraded_via:
         record["degraded_via"] = degraded_via
@@ -694,8 +695,14 @@ def format_progress(channel: str, done: int, total: int, elapsed_seconds: float)
     )
 
 
-def load_done_seconds(out_path: Path) -> set:
-    """讀取已輸出的 jsonl，取出已經處理過的 video_second，供斷點續跑跳過用。"""
+def load_done_seconds(out_path: Path, required_prompt_version: Optional[int] = PROMPT_VERSION) -> set:
+    """讀取已輸出的 jsonl，取出已經處理過的 video_second，供斷點續跑跳過用。
+
+    required_prompt_version 給定時，只有記錄裡的 prompt_version 跟現在的版本
+    一致才算「已完成」；版本不符（包含舊資料根本沒有這個欄位，視為版本不符）
+    一律當作還沒處理，確保改了 PROMPT 之後重跑會真的用新 prompt 重新問一次，
+    不會被斷點續跑誤判成「已經做過」而跳過。required_prompt_version=None 時
+    不檢查版本（舊行為，單純依 video_second 判斷）。"""
     if not out_path.exists():
         return set()
     done = set()
@@ -704,6 +711,8 @@ def load_done_seconds(out_path: Path) -> set:
         if not line:
             continue
         rec = json.loads(line)
+        if required_prompt_version is not None and rec.get("prompt_version") != required_prompt_version:
+            continue
         done.add(rec.get("video_second"))
     return done
 
