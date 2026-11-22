@@ -87,6 +87,10 @@ DEFAULT_THINK = False
 HEARTBEAT_REUSE_THRESHOLD = 10  # 心跳整體雜湊：差不多（<=10）就沿用上次結果
 EVENT_DEDUP_THRESHOLD = 20      # 事件 bar 雜湊：幾乎相同（<=20）才當重複跳過
 
+# 每次改動 PROMPT 或 RESPONSE_SCHEMA 都要把這個版本號加 1：快取 key 會把它算進去，
+# 確保 prompt 改了之後舊的快取結果不會被誤用（cache key 只看圖片內容，不看 prompt）。
+PROMPT_VERSION = 2
+
 SCREEN_TYPES = ["news", "ad_wrap", "full_ad", "promo", "other"]
 
 RESPONSE_SCHEMA = {
@@ -106,6 +110,7 @@ PROMPT = """你是台灣電視新聞的監看助手。你會看到兩張圖：
 判斷規則（很重要）：
 - 畫面下方的「主標題 bar」（通常是一整條有底色的粗體字，例如深色底、黃底等）才算是「這一則新聞的標題」。
 - 最下面持續捲動的跑馬燈、另外的「快訊」色塊、角落的天氣小部件，都不算本則新聞標題，不要拿來填 main_title，也不要讓它們影響你的判斷。
+- 特別注意「受訪者/專家口白字幕」：畫面上常見一個白底或淺色底的小方塊，上面一行是人名跟職稱（例如「消防專家 林金宏」、「當事民眾(聲源)」），下面接著一句話，那是這個人說話的原音字幕，**不是新聞標題**，絕對不要把這句話當成 main_title。如果當下只看得到這種口白字幕、看不到真正有底色的主標題 bar（例如標題欄只顯示台名、或整個是空的），main_title 請填空字串 ""，main_title_visible 請填 false，不要用口白字幕湊數。
 - 如果節目當下主畫面播的就是天氣報告（天氣佔據主標題 bar/主畫面，不是角落小部件），那就正常把天氣相關文字當作 main_title。
 - 同一則新聞可能會經過「主播稿頭→記者報導(SOT)→連線」等不同畫面，只要主標題 bar 文字沒變，都算同一則，請照實回報目前畫面上的文字，不用推測是否為同一則。
 
@@ -181,6 +186,7 @@ def compute_cache_key(full_bytes: bytes, crop_bytes: bytes) -> str:
     h = hashlib.sha256()
     h.update(full_bytes)
     h.update(crop_bytes)
+    h.update(f"prompt_v{PROMPT_VERSION}".encode("utf-8"))
     return h.hexdigest()
 
 

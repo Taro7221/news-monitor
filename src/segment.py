@@ -630,6 +630,96 @@ def build_fill_events(
     return fill_events
 
 
+DEFAULT_MAX_ITEMS_PER_MINUTE = 2
+DEFAULT_MIN_FRAMES_FOR_SECONDARY = 2
+
+
+def select_dominant_per_minute(
+    channel: str,
+    vlm_results_path: Path,
+    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
+    similarity_fn: Callable[[str, str], float] = default_similarity,
+    high_threshold: float = MERGE_HIGH_THRESHOLD,
+    low_threshold: float = MERGE_LOW_THRESHOLD,
+    max_items_per_minute: int = DEFAULT_MAX_ITEMS_PER_MINUTE,
+    min_frames_for_secondary: int = DEFAULT_MIN_FRAMES_FOR_SECONDARY,
+) -> dict[int, list[dict]]:
+    """給 fill.py 用：範本實際上幾乎每格只有一個五字標，帶斜線的多半是人工誤植，
+    所以不要「每個換則事件都塞進去用/相連」，改成每一分鐘直接統計這一分鐘內
+    （不分事件邊界，整分鐘所有 heartbeat/event 讀值）各候選的「比例」
+    （= 支持的讀值筆數），只留比例最高的最多 max_items_per_minute 個：
+    - 廣告（screen_type 是 full_ad/ad_wrap）一律算同一組，輸出「廣告」，不會因為
+      偶爾文字不同就被拆成好幾個廣告候選。
+    - 新聞讀值依文字相似度（模糊地帶可用 vlm_judge_fn）分組，組內讀值數最多的
+      字串當代表。
+    - 第二名要有至少 min_frames_for_secondary 筆讀值支持才會被列進來，避免單一
+      雜訊幀也被當成「這分鐘另一則新聞」。
+
+    回傳 {minute_code: [{"kind": "news"|"ad", "label":, "frame_count":,
+    "confidence":}, ...]}（已依讀值數由高到低排序）。"""
+    frames = load_vlm_results(vlm_results_path)
+
+    by_minute: dict[int, list[dict]] = {}
+    for f in frames:
+        minute = f.get("minute_code")
+        if minute is None:
+            continue
+        by_minute.setdefault(minute, []).append(f)
+
+    result: dict[int, list[dict]] = {}
+    for minute, minute_frames in by_minute.items():
+        ad_frames = [f for f in minute_frames if f["screen_type"] in AD_SCREEN_TYPES]
+        news_frames = [
+            f for f in minute_frames
+            if f["screen_type"] == "news" and f.get("main_title_visible") and f.get("main_title")
+        ]
+
+        groups: list[dict] = []
+        if ad_frames:
+            groups.append({"kind": "ad", "label": "廣告", "members": ad_frames})
+
+        for f in news_frames:
+            placed = False
+            for g in groups:
+                if g["kind"] != "news":
+                    continue
+                rep_title = g["members"][0]["main_title"]
+                score = similarity_fn(rep_title, f["main_title"])
+                if score >= high_threshold:
+                    same = True
+                elif score <= low_threshold:
+                    same = False
+                elif vlm_judge_fn is not None:
+                    try:
+                        same = vlm_judge_fn(rep_title, f["main_title"])
+                    except Exception:
+                        same = False
+                else:
+                    same = False
+                if same:
+                    g["members"].append(f)
+                    placed = True
+                    break
+            if not placed:
+                groups.append({"kind": "news", "label": f["main_title"], "members": [f]})
+
+        groups.sort(key=lambda g: len(g["members"]), reverse=True)
+
+        chosen = []
+        for i, g in enumerate(groups[:max_items_per_minute]):
+            if i >= 1 and len(g["members"]) < min_frames_for_secondary:
+                break
+            chosen.append({
+                "kind": g["kind"],
+                "label": g["label"],
+                "frame_count": len(g["members"]),
+                "confidence": max(m.get("confidence", 1.0) for m in g["members"]),
+            })
+        result[minute] = chosen
+
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="分段：把 vlm.py 的逐秒判讀結果整理成一串「則」（本機運算，不呼叫 VLM）")
     parser.add_argument("--channel", required=True)

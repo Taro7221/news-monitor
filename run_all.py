@@ -65,13 +65,13 @@ def run_fill(channels: list[str], tag: str, output_path: str, use_vlm_labels: bo
         def vlm_judge_fn(title_a, title_b):
             return segment.call_vlm_judge_same_story(title_a, title_b, judge_env)
 
-    channels_fill_events = {}
+    channels_minute_groups = {}
     for ch in channels:
         vlm_path = fill.OUT_DIR / f"{ch}{tag}_vlm.jsonl"
         if not vlm_path.exists():
             print(f"[skip] {vlm_path} 不存在")
             continue
-        channels_fill_events[ch] = segment.build_fill_events(ch, vlm_path, vlm_judge_fn=vlm_judge_fn)
+        channels_minute_groups[ch] = segment.select_dominant_per_minute(ch, vlm_path, vlm_judge_fn=vlm_judge_fn)
 
     vlm_text_fn = None
     if use_vlm_labels:
@@ -81,8 +81,8 @@ def run_fill(channels: list[str], tag: str, output_path: str, use_vlm_labels: bo
             return segment.call_vlm_for_label(title, attempt, prev_violations, env)
 
     return fill.fill_workbook(
-        channels_fill_events, output_path=Path(output_path),
-        use_vlm=use_vlm_labels, vlm_text_fn=vlm_text_fn, vlm_judge_fn=vlm_judge_fn,
+        channels_minute_groups, output_path=Path(output_path),
+        use_vlm=use_vlm_labels, vlm_text_fn=vlm_text_fn,
     )
 
 

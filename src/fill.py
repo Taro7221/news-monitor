@@ -60,15 +60,17 @@ def minute_code_to_row(minute_code: Optional[int]) -> Optional[int]:
 
 
 def default_label_fn(
-    event: dict,
+    item: dict,
     use_vlm: bool = False,
     vlm_text_fn: Optional[Callable] = None,
 ) -> tuple[str, bool, str]:
-    """把一筆 fill event 轉成 (實際寫入的文字, 是否低信心度, 註解文字)。"""
-    if event["kind"] == "ad":
+    """把 segment.select_dominant_per_minute 選出的一個候選
+    {"kind":, "label":, "frame_count":, "confidence":} 轉成
+    (實際寫入的文字, 是否低信心度, 註解文字)。"""
+    if item["kind"] == "ad":
         return "廣告", False, ""
 
-    title = event["label"]  # 合併後的代表標題（尚未轉五字標）
+    title = item["label"]  # 該分鐘內最多讀值支持的代表標題（尚未轉五字標）
     fallback_used = True
     if use_vlm and vlm_text_fn is not None:
         result = segment.generate_five_char_label(title, vlm_text_fn)
@@ -77,94 +79,35 @@ def default_label_fn(
     else:
         label = segment.fallback_keyword_label(title)
 
-    low_conf = (
-        event["confidence"] < LOW_CONF_FILL_THRESHOLD
-        or event.get("ambiguous_next") is not None
-        or fallback_used
-    )
+    low_conf = item["confidence"] < LOW_CONF_FILL_THRESHOLD or fallback_used
 
-    note_parts = [f"原標題：{title}", f"信心度 {event['confidence']:.2f}"]
-    if event.get("ambiguous_next"):
-        note_parts.append("換則判斷不確定（相似度落在模糊地帶），已保守切成新的一則，建議人工覆核")
+    note_parts = [
+        f"原標題：{title}",
+        f"信心度 {item['confidence']:.2f}",
+        f"該分鐘內有 {item['frame_count']} 筆讀值支持",
+    ]
     if fallback_used:
         note_parts.append("五字標為關鍵字擷取退路產生（非 VLM 生成），建議人工覆核")
     return label, low_conf, "；".join(note_parts)
 
 
-def consolidate_same_minute_events(
-    events: list[dict],
-    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
-    similarity_fn: Callable[[str, str], float] = segment.default_similarity,
-    high_threshold: float = segment.MERGE_HIGH_THRESHOLD,
-    low_threshold: float = segment.MERGE_LOW_THRESHOLD,
-) -> list[dict]:
-    """events 是同一分鐘內、已依時間排序的 news fill events（還沒轉五字標，
-    event["label"] 是合併後的代表標題）。
-
-    用文字相似度（模糊地帶可選擇呼叫 vlm_judge_fn）判斷這些候選是不是其實
-    指向同一則新聞——這是為了修正 merge_continuations 因為相似度門檻誤差，
-    把同一則拆成好幾個、剛好都落在同一分鐘的狀況。確認是同一則就合併成一組
-    （只留信心度最高的代表，共用同一個五字標）；確認是不同新聞就保留分開
-    （docs/template_spec.md 的範例證實同分鐘多則是真實存在的合法情況，
-    不能強制整欄只能有一個五字標）。回傳保留下來的代表事件（依時間排序）。"""
-    if len(events) <= 1:
-        return list(events)
-
-    groups: list[list[dict]] = []
-    for ev in events:
-        placed = False
-        for g in groups:
-            rep = max(g, key=lambda e: e["confidence"])
-            score = similarity_fn(rep["label"], ev["label"])
-            if score >= high_threshold:
-                same = True
-            elif score <= low_threshold:
-                same = False
-            elif vlm_judge_fn is not None:
-                try:
-                    same = vlm_judge_fn(rep["label"], ev["label"])
-                except Exception:
-                    # 判斷失敗就保守當作不同則，不要讓單一次呼叫失敗拖垮整批
-                    same = False
-            else:
-                same = False
-            if same:
-                g.append(ev)
-                placed = True
-                break
-        if not placed:
-            groups.append([ev])
-
-    representatives = [max(g, key=lambda e: e["confidence"]) for g in groups]
-    representatives.sort(key=lambda e: e["video_second"])
-    return representatives
-
-
 def build_cell_plan(
-    fill_events: list[dict],
+    minute_groups: dict[int, list[dict]],
     label_fn: Callable[[dict], tuple[str, bool, str]],
-    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
 ) -> dict[int, dict]:
-    """把一台的 fill_events 轉成 {row: {"text":, "low_conf":, "notes":[...]}}。
-    同一列（同一分鐘）有多筆 news 事件時，先用 consolidate_same_minute_events
-    確認是否其實是同一則；確認不同的才會用「/」相連。"""
-    by_row: dict[int, list[dict]] = {}
-    for ev in fill_events:
-        row = minute_code_to_row(ev.get("minute_code"))
-        if row is None:
-            continue
-        by_row.setdefault(row, []).append(ev)
-
+    """把 segment.select_dominant_per_minute 的結果轉成
+    {row: {"text":, "low_conf":, "notes":[...]}}。每一分鐘最多兩個候選
+    （已經在 select_dominant_per_minute 依讀值比例篩過），只有真的篩出
+    兩個才會用「/」相連；只有一個就直接輸出那一個。"""
     plan: dict[int, dict] = {}
-    for row, row_events in by_row.items():
-        news_events = [e for e in row_events if e["kind"] == "news"]
-        other_events = [e for e in row_events if e["kind"] != "news"]
-        consolidated_news = consolidate_same_minute_events(news_events, vlm_judge_fn=vlm_judge_fn)
-        ordered = sorted(other_events + consolidated_news, key=lambda e: e["video_second"])
+    for minute_code, groups in minute_groups.items():
+        row = minute_code_to_row(minute_code)
+        if row is None or not groups:
+            continue
 
         items = []
-        for ev in ordered:
-            label, low_conf, note = label_fn(ev)
+        for g in groups:
+            label, low_conf, note = label_fn(g)
             items.append({"label": label, "low_conf": low_conf, "note": note})
 
         plan[row] = {
@@ -186,27 +129,28 @@ def apply_plan_to_sheet(ws, column: str, plan: dict[int, dict]) -> None:
 
 
 def fill_workbook(
-    channels_fill_events: dict[str, list[dict]],
+    channels_minute_groups: dict[str, dict[int, list[dict]]],
     template_path: Path = DEFAULT_TEMPLATE_PATH,
     output_path: Path = DEFAULT_OUTPUT_PATH,
     use_vlm: bool = False,
     vlm_text_fn: Optional[Callable] = None,
-    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
 ) -> dict:
+    """channels_minute_groups：channel -> segment.select_dominant_per_minute 的結果
+    （{minute_code: [{"kind":,"label":,"frame_count":,"confidence":}, ...]}）。"""
     wb = openpyxl.load_workbook(str(template_path))
     ws = wb[SHEET_NAME]
 
     stats: dict[str, dict] = {}
-    for channel, fill_events in channels_fill_events.items():
+    for channel, minute_groups in channels_minute_groups.items():
         column = CHANNEL_COLUMNS.get(channel)
         if not column:
             print(f"[skip] 不認得的頻道：{channel}")
             continue
 
-        def label_fn(ev, _use_vlm=use_vlm, _vlm_text_fn=vlm_text_fn):
-            return default_label_fn(ev, use_vlm=_use_vlm, vlm_text_fn=_vlm_text_fn)
+        def label_fn(item, _use_vlm=use_vlm, _vlm_text_fn=vlm_text_fn):
+            return default_label_fn(item, use_vlm=_use_vlm, vlm_text_fn=_vlm_text_fn)
 
-        plan = build_cell_plan(fill_events, label_fn, vlm_judge_fn=vlm_judge_fn)
+        plan = build_cell_plan(minute_groups, label_fn)
         apply_plan_to_sheet(ws, column, plan)
         stats[channel] = {
             "filled_rows": len(plan),
@@ -235,13 +179,13 @@ def main() -> int:
         def vlm_judge_fn(title_a, title_b):
             return segment.call_vlm_judge_same_story(title_a, title_b, judge_env)
 
-    channels_fill_events = {}
+    channels_minute_groups = {}
     for ch in args.channels:
         vlm_path = OUT_DIR / f"{ch}{args.tag}_vlm.jsonl"
         if not vlm_path.exists():
             print(f"[skip] {vlm_path} 不存在")
             continue
-        channels_fill_events[ch] = segment.build_fill_events(ch, vlm_path, vlm_judge_fn=vlm_judge_fn)
+        channels_minute_groups[ch] = segment.select_dominant_per_minute(ch, vlm_path, vlm_judge_fn=vlm_judge_fn)
 
     vlm_text_fn = None
     if args.use_vlm_labels:
@@ -251,9 +195,9 @@ def main() -> int:
             return segment.call_vlm_for_label(title, attempt, prev_violations, env)
 
     stats = fill_workbook(
-        channels_fill_events,
+        channels_minute_groups,
         template_path=Path(args.template), output_path=Path(args.output),
-        use_vlm=args.use_vlm_labels, vlm_text_fn=vlm_text_fn, vlm_judge_fn=vlm_judge_fn,
+        use_vlm=args.use_vlm_labels, vlm_text_fn=vlm_text_fn,
     )
 
     print(f"[ok] 輸出 {args.output}")

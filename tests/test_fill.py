@@ -21,17 +21,17 @@ def test_minute_code_to_row_out_of_range_is_none():
     assert fill.minute_code_to_row(None) is None
 
 
-def test_default_label_fn_ad_event_is_literal():
-    event = {"kind": "ad", "label": "廣告", "confidence": 1.0, "ambiguous_next": None}
-    label, low_conf, note = fill.default_label_fn(event)
+def test_default_label_fn_ad_item_is_literal():
+    item = {"kind": "ad", "label": "廣告", "confidence": 1.0, "frame_count": 10}
+    label, low_conf, note = fill.default_label_fn(item)
     assert label == "廣告"
     assert low_conf is False
     assert note == ""
 
 
 def test_default_label_fn_news_without_vlm_uses_fallback_and_flags_low_conf():
-    event = {"kind": "news", "label": "台北市中山區發生車禍", "confidence": 0.9, "ambiguous_next": None}
-    label, low_conf, note = fill.default_label_fn(event, use_vlm=False)
+    item = {"kind": "news", "label": "台北市中山區發生車禍", "confidence": 0.9, "frame_count": 3}
+    label, low_conf, note = fill.default_label_fn(item, use_vlm=False)
     assert len(label) == 5
     assert low_conf is True  # fallback_used 一律標低信心度
     assert "關鍵字擷取" in note
@@ -41,8 +41,8 @@ def test_default_label_fn_news_with_vlm_valid_result_not_flagged_for_fallback():
     def fake_vlm_fn(title, attempt, prev):
         return "台北車禍案"
 
-    event = {"kind": "news", "label": "台北市中山區發生車禍", "confidence": 0.9, "ambiguous_next": None}
-    label, low_conf, note = fill.default_label_fn(event, use_vlm=True, vlm_text_fn=fake_vlm_fn)
+    item = {"kind": "news", "label": "台北市中山區發生車禍", "confidence": 0.9, "frame_count": 3}
+    label, low_conf, note = fill.default_label_fn(item, use_vlm=True, vlm_text_fn=fake_vlm_fn)
     assert label == "台北車禍案"
     assert low_conf is False
     assert "關鍵字擷取" not in note
@@ -52,142 +52,83 @@ def test_default_label_fn_low_confidence_flagged():
     def fake_vlm_fn(title, attempt, prev):
         return "台北車禍案"
 
-    event = {"kind": "news", "label": "台北市中山區發生車禍", "confidence": 0.2, "ambiguous_next": None}
-    label, low_conf, note = fill.default_label_fn(event, use_vlm=True, vlm_text_fn=fake_vlm_fn)
+    item = {"kind": "news", "label": "台北市中山區發生車禍", "confidence": 0.2, "frame_count": 1}
+    label, low_conf, note = fill.default_label_fn(item, use_vlm=True, vlm_text_fn=fake_vlm_fn)
     assert low_conf is True
     assert "信心度 0.20" in note
 
 
-def test_default_label_fn_ambiguous_next_flagged():
+def test_default_label_fn_note_includes_frame_count():
     def fake_vlm_fn(title, attempt, prev):
         return "台北車禍案"
 
-    event = {
-        "kind": "news", "label": "台北市中山區發生車禍", "confidence": 0.9,
-        "ambiguous_next": {"other_title": "x", "other_second": 10, "score": 70},
+    item = {"kind": "news", "label": "台北市中山區發生車禍", "confidence": 0.9, "frame_count": 7}
+    _, _, note = fill.default_label_fn(item, use_vlm=True, vlm_text_fn=fake_vlm_fn)
+    assert "7 筆讀值支持" in note
+
+
+def test_build_cell_plan_single_item_per_minute_no_slash():
+    minute_groups = {
+        1200: [{"kind": "news", "label": "A", "confidence": 0.9, "frame_count": 10}],
     }
-    label, low_conf, note = fill.default_label_fn(event, use_vlm=True, vlm_text_fn=fake_vlm_fn)
-    assert low_conf is True
-    assert "換則判斷不確定" in note
+
+    def label_fn(item):
+        return item["label"], False, ""
+
+    plan = fill.build_cell_plan(minute_groups, label_fn)
+    assert plan[5]["text"] == "A"
 
 
-def test_build_cell_plan_joins_same_minute_with_slash():
-    events = [
-        {"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 0},
-        {"kind": "news", "label": "B", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 1},
-    ]
+def test_build_cell_plan_two_items_joined_with_slash():
+    minute_groups = {
+        1200: [
+            {"kind": "news", "label": "A", "confidence": 0.9, "frame_count": 10},
+            {"kind": "news", "label": "B", "confidence": 0.9, "frame_count": 4},
+        ],
+    }
 
-    def label_fn(ev):
-        return ev["label"], False, ""
+    def label_fn(item):
+        return item["label"], False, ""
 
-    plan = fill.build_cell_plan(events, label_fn)
+    plan = fill.build_cell_plan(minute_groups, label_fn)
     assert plan[5]["text"] == "A/B"
     assert plan[5]["low_conf"] is False
 
 
 def test_build_cell_plan_any_low_conf_marks_whole_cell():
-    events = [
-        {"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 0},
-        {"kind": "news", "label": "B", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 1},
-    ]
+    minute_groups = {
+        1200: [
+            {"kind": "news", "label": "A", "confidence": 0.9, "frame_count": 10},
+            {"kind": "news", "label": "B", "confidence": 0.9, "frame_count": 4},
+        ],
+    }
 
-    def label_fn(ev):
-        return ev["label"], ev["label"] == "B", f"note-{ev['label']}"
+    def label_fn(item):
+        return item["label"], item["label"] == "B", f"note-{item['label']}"
 
-    plan = fill.build_cell_plan(events, label_fn)
+    plan = fill.build_cell_plan(minute_groups, label_fn)
     assert plan[5]["low_conf"] is True
     assert "note-B" in plan[5]["notes"]
 
 
 def test_build_cell_plan_skips_out_of_range_minute():
-    events = [{"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1300, "video_second": 0}]
+    minute_groups = {1300: [{"kind": "news", "label": "A", "confidence": 0.9, "frame_count": 10}]}
 
-    def label_fn(ev):
-        return ev["label"], False, ""
+    def label_fn(item):
+        return item["label"], False, ""
 
-    plan = fill.build_cell_plan(events, label_fn)
+    plan = fill.build_cell_plan(minute_groups, label_fn)
     assert plan == {}
 
 
-def test_consolidate_same_minute_events_merges_near_identical_titles():
-    events = [
-        {"kind": "news", "label": "汽油彈襲警車罪加一等", "confidence": 0.9, "video_second": 300},
-        {"kind": "news", "label": "汽油彈襲警車罪一等", "confidence": 0.5, "video_second": 320},
-    ]
-    result = fill.consolidate_same_minute_events(events)
-    assert len(result) == 1
-    assert result[0]["label"] == "汽油彈襲警車罪加一等"  # 信心度較高的當代表
+def test_build_cell_plan_skips_minute_with_no_groups():
+    minute_groups = {1200: []}
 
+    def label_fn(item):
+        return item["label"], False, ""
 
-def test_consolidate_same_minute_events_keeps_genuinely_different_apart():
-    events = [
-        {"kind": "news", "label": "持刀警開槍", "confidence": 0.9, "video_second": 300},
-        {"kind": "news", "label": "台股二補跌", "confidence": 0.9, "video_second": 320},
-    ]
-    result = fill.consolidate_same_minute_events(events)
-    assert len(result) == 2
-
-
-def test_consolidate_same_minute_events_ambiguous_uses_vlm_judge():
-    def fake_similarity(a, b):
-        return 70.0  # 介於門檻之間
-
-    events = [
-        {"kind": "news", "label": "標題A", "confidence": 0.9, "video_second": 300},
-        {"kind": "news", "label": "標題B", "confidence": 0.9, "video_second": 320},
-    ]
-    merged = fill.consolidate_same_minute_events(events, vlm_judge_fn=lambda a, b: True, similarity_fn=fake_similarity)
-    assert len(merged) == 1
-    split = fill.consolidate_same_minute_events(events, vlm_judge_fn=lambda a, b: False, similarity_fn=fake_similarity)
-    assert len(split) == 2
-
-
-def test_consolidate_same_minute_events_vlm_judge_exception_degrades_to_different():
-    def fake_similarity(a, b):
-        return 70.0  # 介於門檻之間
-
-    def failing_judge(a, b):
-        raise RuntimeError("VLM 呼叫失敗，重試 3 次仍失敗")
-
-    events = [
-        {"kind": "news", "label": "標題A", "confidence": 0.9, "video_second": 300},
-        {"kind": "news", "label": "標題B", "confidence": 0.9, "video_second": 320},
-    ]
-    # 不應該讓例外往外丟崩潰，應該保守當作不同則
-    result = fill.consolidate_same_minute_events(events, vlm_judge_fn=failing_judge, similarity_fn=fake_similarity)
-    assert len(result) == 2
-
-
-def test_consolidate_same_minute_events_preserves_chronological_order():
-    events = [
-        {"kind": "news", "label": "乙新聞", "confidence": 0.9, "video_second": 320},
-        {"kind": "news", "label": "甲新聞", "confidence": 0.9, "video_second": 300},
-    ]
-    result = fill.consolidate_same_minute_events(events)
-    assert [e["label"] for e in result] == ["甲新聞", "乙新聞"]
-
-
-def test_build_cell_plan_passes_vlm_judge_fn_to_consolidation(monkeypatch):
-    events = [
-        {"kind": "news", "label": "A", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1200, "video_second": 0},
-        {"kind": "news", "label": "B", "confidence": 0.5, "ambiguous_next": None, "minute_code": 1200, "video_second": 10},
-    ]
-    captured = {}
-
-    def fake_consolidate(news_events, vlm_judge_fn=None):
-        captured["vlm_judge_fn"] = vlm_judge_fn
-        return news_events[:1]  # 假裝合併成一個，驗證 build_cell_plan 真的會用這個結果
-
-    monkeypatch.setattr(fill, "consolidate_same_minute_events", fake_consolidate)
-
-    def label_fn(ev):
-        return ev["label"], False, ""
-
-    sentinel = lambda a, b: True
-    plan = fill.build_cell_plan(events, label_fn, vlm_judge_fn=sentinel)
-
-    assert captured["vlm_judge_fn"] is sentinel
-    assert plan[5]["text"] == "A"
+    plan = fill.build_cell_plan(minute_groups, label_fn)
+    assert plan == {}
 
 
 def _make_minimal_template(path: Path):
@@ -207,11 +148,11 @@ def test_fill_workbook_only_touches_target_columns(tmp_path):
     _make_minimal_template(template_path)
     output_path = tmp_path / "out.xlsx"
 
-    channels_fill_events = {
-        "ftv": [{"kind": "ad", "label": "廣告", "confidence": 1.0, "ambiguous_next": None, "minute_code": 1200, "video_second": 0}],
-        "cts": [{"kind": "news", "label": "某則新聞標題", "confidence": 0.9, "ambiguous_next": None, "minute_code": 1201, "video_second": 60}],
+    channels_minute_groups = {
+        "ftv": {1200: [{"kind": "ad", "label": "廣告", "confidence": 1.0, "frame_count": 10}]},
+        "cts": {1201: [{"kind": "news", "label": "某則新聞標題", "confidence": 0.9, "frame_count": 5}]},
     }
-    stats = fill.fill_workbook(channels_fill_events, template_path=template_path, output_path=output_path)
+    stats = fill.fill_workbook(channels_minute_groups, template_path=template_path, output_path=output_path)
 
     wb = openpyxl.load_workbook(output_path)
     ws = wb[fill.SHEET_NAME]
@@ -228,10 +169,10 @@ def test_fill_workbook_marks_low_confidence_with_fill_and_comment(tmp_path):
     _make_minimal_template(template_path)
     output_path = tmp_path / "out.xlsx"
 
-    channels_fill_events = {
-        "ftv": [{"kind": "news", "label": "某則新聞標題", "confidence": 0.1, "ambiguous_next": None, "minute_code": 1200, "video_second": 0}],
+    channels_minute_groups = {
+        "ftv": {1200: [{"kind": "news", "label": "某則新聞標題", "confidence": 0.1, "frame_count": 1}]},
     }
-    fill.fill_workbook(channels_fill_events, template_path=template_path, output_path=output_path)
+    fill.fill_workbook(channels_minute_groups, template_path=template_path, output_path=output_path)
 
     wb = openpyxl.load_workbook(output_path)
     ws = wb[fill.SHEET_NAME]
@@ -240,22 +181,21 @@ def test_fill_workbook_marks_low_confidence_with_fill_and_comment(tmp_path):
     assert cell.comment is not None
 
 
-def test_main_passes_vlm_judge_fn_when_flag_set(tmp_path, monkeypatch):
+def test_main_passes_vlm_judge_fn_to_select_dominant_per_minute_when_flag_set(tmp_path, monkeypatch):
     vlm_path = tmp_path / "ftv_vlm.jsonl"
     vlm_path.write_text("", encoding="utf-8")
     monkeypatch.setattr(fill, "OUT_DIR", tmp_path)
 
     captured = {}
 
-    def fake_build_fill_events(channel, path, vlm_judge_fn=None):
+    def fake_select(channel, path, vlm_judge_fn=None):
         captured["vlm_judge_fn"] = vlm_judge_fn
-        return []
+        return {}
 
-    monkeypatch.setattr(fill.segment, "build_fill_events", fake_build_fill_events)
+    monkeypatch.setattr(fill.segment, "select_dominant_per_minute", fake_select)
     monkeypatch.setattr(fill, "fill_workbook", lambda *a, **k: {})
     monkeypatch.setattr(fill.vlm, "load_vlm_env", lambda: {"url": "http://fake", "user": "", "password": "", "model": "m"})
 
-    import sys
     monkeypatch.setattr(sys, "argv", ["fill.py", "--channels", "ftv", "--use-vlm-judge"])
     fill.main()
 
@@ -269,14 +209,13 @@ def test_main_vlm_judge_fn_none_without_flag(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_build_fill_events(channel, path, vlm_judge_fn=None):
+    def fake_select(channel, path, vlm_judge_fn=None):
         captured["vlm_judge_fn"] = vlm_judge_fn
-        return []
+        return {}
 
-    monkeypatch.setattr(fill.segment, "build_fill_events", fake_build_fill_events)
+    monkeypatch.setattr(fill.segment, "select_dominant_per_minute", fake_select)
     monkeypatch.setattr(fill, "fill_workbook", lambda *a, **k: {})
 
-    import sys
     monkeypatch.setattr(sys, "argv", ["fill.py", "--channels", "ftv"])
     fill.main()
 

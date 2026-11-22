@@ -490,6 +490,131 @@ def test_build_fill_events_no_ad_when_streak_too_short(tmp_path):
     assert all(e["kind"] == "news" for e in events)
 
 
+def _vlm_rec(sec, minute, screen_type="news", title="", visible=True, conf=0.9):
+    return {
+        "video_second": sec, "minute_code": minute,
+        "result": {"screen_type": screen_type, "main_title": title, "main_title_visible": visible, "confidence": conf},
+    }
+
+
+def test_select_dominant_per_minute_single_item_no_second(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = [_vlm_rec(i, 1200, title="甲則新聞") for i in range(5)]
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path)
+    assert len(result[1200]) == 1
+    assert result[1200][0]["label"] == "甲則新聞"
+    assert result[1200][0]["frame_count"] == 5
+
+
+def test_select_dominant_per_minute_picks_top_two_by_proportion(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = (
+        [_vlm_rec(i, 1200, title="多數新聞") for i in range(6)]
+        + [_vlm_rec(10 + i, 1200, title="次要新聞") for i in range(3)]
+        + [_vlm_rec(20, 1200, title="極少雜訊", conf=0.1)]  # 只有1筆，不應該被列為第二名
+    )
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path, min_frames_for_secondary=2)
+    labels = [g["label"] for g in result[1200]]
+    assert labels == ["多數新聞", "次要新聞"]  # 依比例排序，雜訊(只有1筆)被排除
+
+
+def test_select_dominant_per_minute_respects_max_items_per_minute(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = (
+        [_vlm_rec(i, 1200, title="A") for i in range(5)]
+        + [_vlm_rec(10 + i, 1200, title="B") for i in range(4)]
+        + [_vlm_rec(20 + i, 1200, title="C") for i in range(3)]
+    )
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path, max_items_per_minute=2)
+    assert len(result[1200]) == 2
+    assert [g["label"] for g in result[1200]] == ["A", "B"]
+
+
+def test_select_dominant_per_minute_ads_collapse_into_one_group_regardless_of_text_noise(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    # 廣告讀值 screen_type 不同（full_ad / ad_wrap）、文字也雜訊不一，應該都算同一組「廣告」
+    records = [
+        _vlm_rec(0, 1200, screen_type="full_ad", title="", visible=False),
+        _vlm_rec(5, 1200, screen_type="ad_wrap", title="雜訊文字A", visible=True),
+        _vlm_rec(10, 1200, screen_type="full_ad", title="雜訊文字B", visible=True),
+        _vlm_rec(15, 1200, title="唯一新聞", visible=True),
+    ]
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path, min_frames_for_secondary=2)
+    assert len(result[1200]) == 1
+    assert result[1200][0]["kind"] == "ad"
+    assert result[1200][0]["label"] == "廣告"
+    assert result[1200][0]["frame_count"] == 3  # 3 筆廣告讀值都算同一組
+
+
+def test_select_dominant_per_minute_uses_vlm_judge_for_ambiguous(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = [_vlm_rec(0, 1200, title="標題A")] + [_vlm_rec(5, 1200, title="標題B")]
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    def fake_similarity(a, b):
+        return 70.0  # 模糊地帶
+
+    merged = segment.select_dominant_per_minute(
+        "ftv", path, vlm_judge_fn=lambda a, b: True, similarity_fn=fake_similarity,
+        min_frames_for_secondary=1,
+    )
+    assert len(merged[1200]) == 1
+
+    split = segment.select_dominant_per_minute(
+        "ftv", path, vlm_judge_fn=lambda a, b: False, similarity_fn=fake_similarity,
+        min_frames_for_secondary=1,
+    )
+    assert len(split[1200]) == 2
+
+
+def test_select_dominant_per_minute_vlm_judge_exception_defaults_to_different(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = [_vlm_rec(0, 1200, title="標題A")] + [_vlm_rec(5, 1200, title="標題B")]
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    def fake_similarity(a, b):
+        return 70.0
+
+    def failing_judge(a, b):
+        raise RuntimeError("boom")
+
+    result = segment.select_dominant_per_minute(
+        "ftv", path, vlm_judge_fn=failing_judge, similarity_fn=fake_similarity,
+        min_frames_for_secondary=1,
+    )
+    assert len(result[1200]) == 2  # 不應該崩潰，保守當作不同則
+
+
+def test_select_dominant_per_minute_ignores_frames_without_visible_title(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = [
+        _vlm_rec(0, 1200, title="", visible=False),
+        _vlm_rec(5, 1200, screen_type="other", title="", visible=False),
+        _vlm_rec(10, 1200, title="唯一新聞", visible=True),
+    ]
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path)
+    assert len(result[1200]) == 1
+    assert result[1200][0]["label"] == "唯一新聞"
+    assert result[1200][0]["frame_count"] == 1
+
+
 def test_build_segments_for_channel_logs_low_confidence(tmp_path):
     import json as json_mod
     path = tmp_path / "ftv_vlm.jsonl"
