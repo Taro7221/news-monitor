@@ -175,8 +175,13 @@ def process_channel(
     start_second: int = 0,
     max_seconds: Optional[int] = None,
     events_path: Optional[Path] = None,
+    video_path: Optional[Path] = None,
+    frames_dir: Optional[Path] = None,
 ) -> int:
-    video_path = VIDEOS_DIR / f"{channel}.mp4"
+    """video_path/frames_dir 給外部呼叫端（例如 web/ 上傳 demo）覆寫用，預設
+    走原本的 data/videos/{channel}.mp4、out/frames/{channel}/，CLI 行為不變。"""
+    if video_path is None:
+        video_path = VIDEOS_DIR / f"{channel}.mp4"
     if not video_path.exists():
         print(f"[skip] {video_path} 不存在")
         return 0
@@ -186,7 +191,7 @@ def process_channel(
         print(f"[skip] config/channels.yaml 沒有 {channel}.headline_bar")
         return 0
 
-    channel_frames_dir = FRAMES_DIR / channel
+    channel_frames_dir = frames_dir if frames_dir is not None else FRAMES_DIR / channel
     channel_frames_dir.mkdir(parents=True, exist_ok=True)
     if events_path is None:
         events_path = OUT_DIR / f"{channel}_events.jsonl"
