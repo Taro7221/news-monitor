@@ -354,8 +354,27 @@ def missing_person_name(label: str, original_title: str) -> Optional[str]:
     return None
 
 
+LOW_OVERLAP_LOG_PATH = OUT_DIR / "logs" / "possible_fabrication.jsonl"
+LOW_OVERLAP_LOG_THRESHOLD = 0.2  # 僅供記錄用的軟性門檻，不是驗證失敗的硬性規則
+
+
+def low_overlap_warning(label: str, original_title: str) -> bool:
+    """五字標不需要照抄原標題的完整詞語，用一個有代表性的字/詞代表同一個概念
+    就可以（例如用「漲」代表「通膨」），所以不拿字元重疊率當驗證失敗的硬性
+    規則。但重疊率真的非常低時，值得記錄下來讓人事後抽查是不是真的編造內容，
+    而不是語意代換——這裡只回傳 True/False，呼叫端自行決定要不要寫 log。"""
+    if not label:
+        return False
+    overlap = sum(1 for ch in label if ch in original_title)
+    return (overlap / len(label)) < LOW_OVERLAP_LOG_THRESHOLD
+
+
 def validate_five_char_label(label: str, original_title: str) -> list[str]:
-    """回傳違反的規則清單；空清單代表通過。"""
+    """回傳違反的規則清單；空清單代表通過。
+
+    注意：五字標不要求照抄原標題的完整詞語，只要語意對應（例如用「漲」代表
+    「通膨」、用一個字代表一整個詞）就算合格，所以這裡不會因為字元跟原標題
+    重疊率低就判定失敗——那種情況改成 low_overlap_warning 做非阻擋性的記錄。"""
     violations = []
 
     if len(label) != LABEL_LENGTH:
@@ -367,11 +386,6 @@ def validate_five_char_label(label: str, original_title: str) -> list[str]:
             violations.append("社會新聞五字標缺少地點")
         elif not any(loc in original_title for loc in label_locations):
             violations.append("五字標的地點沒有出現在原標題，疑似編造")
-
-    if label:
-        overlap = sum(1 for ch in label if ch in original_title)
-        if overlap / len(label) < 0.5:
-            violations.append("五字標與原標題字元重疊過低，疑似編造")
 
     return violations
 
@@ -418,19 +432,28 @@ def _log_person_name_missed(title: str, label: str, missed_name: str, path: Path
         ) + "\n")
 
 
+def _log_low_overlap(title: str, label: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"title": title, "label": label}, ensure_ascii=False) + "\n")
+
+
 def generate_five_char_label(
     title: str,
     vlm_text_fn: Callable[[str, int, Optional[list]], str],
     max_retries: int = LABEL_MAX_RETRIES,
     person_name_log_path: Path = PERSON_NAME_LOG_PATH,
+    low_overlap_log_path: Path = LOW_OVERLAP_LOG_PATH,
 ) -> dict:
     """vlm_text_fn(title, attempt, previous_violations) -> 候選五字標字串。
     介面已就緒，但呼叫端要自己決定什麼時候真的接上會打網路的實作（見
     call_vlm_for_label），不要在批次抽幀/偵測還在跑、搶 GPU 資源時呼叫。
 
-    地點是硬性規則（validate_five_char_label 會擋），人名只是「有出現就盡量
-    填上」，不會因為漏掉人名就重試或判定失敗，但會記錄到
-    out/logs/person_name_missed.jsonl 供事後檢查。"""
+    地點是硬性規則（validate_five_char_label 會擋）。人名、以及五字標跟原
+    標題的字元重疊率，都只是「盡量/供參考」，不會因為漏掉人名或重疊率低
+    就重試或判定失敗（五字標本來就可以用代表字代換，不用照抄原文），但都
+    會各自記錄到 out/logs/person_name_missed.jsonl、
+    out/logs/possible_fabrication.jsonl 供事後抽查。"""
     attempts = []
     for attempt in range(max_retries + 1):
         previous_violations = attempts[-1]["violations"] if attempts else None
@@ -447,6 +470,8 @@ def generate_five_char_label(
             missed_name = missing_person_name(label, title)
             if missed_name:
                 _log_person_name_missed(title, label, missed_name, person_name_log_path)
+            if low_overlap_warning(label, title):
+                _log_low_overlap(title, label, low_overlap_log_path)
             return {
                 "label": label, "attempts": attempts, "fallback_used": False,
                 "missed_person_name": missed_name,
@@ -456,6 +481,8 @@ def generate_five_char_label(
     missed_name = missing_person_name(fallback, title)
     if missed_name:
         _log_person_name_missed(title, fallback, missed_name, person_name_log_path)
+    if low_overlap_warning(fallback, title):
+        _log_low_overlap(title, fallback, low_overlap_log_path)
     return {
         "label": fallback, "attempts": attempts, "fallback_used": True,
         "missed_person_name": missed_name,
@@ -468,7 +495,11 @@ LABEL_PROMPT_TEMPLATE = """你是新聞監看五字標產生器。根據下面�
 
 規則：
 - 剛好 5 個中文字（不要標點、不要英數字，除非原標題本身就是英數字內容）。
-- 只能用原標題裡實際出現過的地點、人物、動作來摘要，不可以自己編造標題沒寫的地點或動作。
+- 目的是讓看的人一眼就能分辨出這是在播哪一則新聞，不是要你抄原標題的完整
+  詞語——可以用語意對應的代表字/詞來濃縮一整個詞或概念，不必是原標題裡逐字
+  出現過的字（例如原標題在講通膨/物價上漲，五字標可以直接用「漲」這個字，
+  就算原標題沒有這個字也沒關係）。但不可以憑空多加原標題根本沒提到的新事實
+  （例如不存在的地名、人名、數字、或結果）。
 - 原標題常常是「起因/背景」+「後續發展/衝突/結果」的複合句（例如「想買單口味
   涼圓，店家不賣爆口角肉身擋車」：前半句只是背景，後半句「爆口角」「肉身擋車」
   才是真正讓這則新聞成為新聞的重點）。摘要時優先濃縮**後半段真正發生的事件/
@@ -551,8 +582,18 @@ def call_vlm_for_label(
 
 
 JUDGE_PROMPT_TEMPLATE = """你是新聞監看助手。下面兩個「標題讀值」是從同一台新聞畫面上不同時間點的
-OCR/VLM 讀值，文字可能因為辨識誤差有些微不同。請判斷這兩個讀值說的是不是同一件新聞事件
-（同一則新聞斷斷續續讀到的不同次結果），而不是兩個不同的新聞事件。
+OCR/VLM 讀值。請判斷這兩個讀值說的是不是同一件新聞事件，而不是兩個不同的新聞事件。
+
+請注意，下面兩種情況都算「同一件新聞事件」(same)：
+1. 文字因為辨識誤差有些微不同，但明顯是同一句話。
+2. 同一個新聞議題/同一則深度報導正在繼續發展，只是換了個子標題、換了個舉例、
+   換了個數字、或換了個切入角度（例如同一則物價上漲的報導，前段標題寫整體
+   通膨數據，後段標題換成某個賣場的因應措施；或同一則意外事故，前段標題寫
+   事故本身，後段標題換成後續調查/傷亡更新）——即使兩次讀到的文字幾乎沒有
+   重疊的字，只要是同一個議題/事件在繼續報導，也算同一件。
+
+只有當兩個讀值明顯是兩個完全不相關的主題（例如一個在報天氣、一個在報車禍）
+時，才回答 different。
 
 標題A：{title_a}
 標題B：{title_b}

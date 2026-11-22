@@ -223,9 +223,9 @@ def test_validate_five_char_label_wrong_length():
     assert any("長度" in v for v in violations)
 
 
-def test_validate_five_char_label_correct_length_passes_overlap_check():
+def test_validate_five_char_label_correct_length_and_location_passes():
     title = "台北市中山區發生車禍一人送醫"
-    label = "台北車禍案"  # 5 字，且字元都出現在原標題
+    label = "台北車禍案"  # 5 字，社會新聞且帶地點
     violations = segment.validate_five_char_label(label, title)
     assert violations == []
 
@@ -237,11 +237,39 @@ def test_validate_five_char_label_social_news_without_location_flagged():
     assert any("地點" in v for v in violations)
 
 
-def test_validate_five_char_label_fabricated_content_flagged():
-    title = "台積電股價創新高"
-    label = "美國總統訪問"  # 跟原標題完全無關，疑似編造
+def test_validate_five_char_label_does_not_block_on_representative_substitution():
+    # 五字標可以用代表字代換概念，不用照抄原文字元，不應該被 validate 擋下來
+    title = "10月CPI仍突破通膨線 通膨連6月超過2%"
+    label = "物價飆漲中"  # 沒有一個字跟原標題重疊，但語意對應（代表通膨/物價上漲）
     violations = segment.validate_five_char_label(label, title)
-    assert any("編造" in v for v in violations)
+    assert violations == []
+
+
+def test_low_overlap_warning_true_for_near_zero_overlap():
+    title = "10月CPI仍突破通膨線 通膨連6月超過2%"
+    label = "物價飆漲中"
+    assert segment.low_overlap_warning(label, title) is True
+
+
+def test_low_overlap_warning_false_when_label_shares_characters():
+    title = "台北市中山區發生車禍一人送醫"
+    label = "台北車禍案"
+    assert segment.low_overlap_warning(label, title) is False
+
+
+def test_generate_five_char_label_logs_low_overlap(tmp_path):
+    def vlm_fn(title, attempt, prev_violations):
+        return "物價飆漲中"
+
+    log_path = tmp_path / "possible_fabrication.jsonl"
+    result = segment.generate_five_char_label(
+        "10月CPI仍突破通膨線 通膨連6月超過2%", vlm_fn, low_overlap_log_path=log_path,
+    )
+    assert result["fallback_used"] is False
+    assert result["label"] == "物價飆漲中"
+    assert log_path.exists()
+    logged = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert logged["label"] == "物價飆漲中"
 
 
 def test_extract_person_name_tokens_finds_surname_candidates():
