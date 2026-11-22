@@ -431,6 +431,45 @@ def test_load_vlm_results_sorts_by_second(tmp_path):
     assert [f["video_second"] for f in frames] == [0, 5]
 
 
+def test_load_vlm_results_dedupes_by_second_keeping_higher_prompt_version(tmp_path):
+    import json as json_mod
+    path = tmp_path / "vlm.jsonl"
+    lines = [
+        {"video_second": 5, "prompt_version": 1, "result": {"screen_type": "news", "main_title": "舊版本被字幕污染", "main_title_visible": True, "confidence": 0.9}},
+        {"video_second": 5, "prompt_version": 2, "result": {"screen_type": "news", "main_title": "新版本修正後", "main_title_visible": True, "confidence": 0.9}},
+    ]
+    path.write_text("\n".join(json_mod.dumps(l) for l in lines), encoding="utf-8")
+    frames = segment.load_vlm_results(path)
+    assert len(frames) == 1
+    assert frames[0]["main_title"] == "新版本修正後"
+
+
+def test_load_vlm_results_missing_prompt_version_treated_as_lowest(tmp_path):
+    import json as json_mod
+    path = tmp_path / "vlm.jsonl"
+    lines = [
+        {"video_second": 5, "result": {"screen_type": "news", "main_title": "沒有版本號的舊資料", "main_title_visible": True, "confidence": 0.9}},
+        {"video_second": 5, "prompt_version": 2, "result": {"screen_type": "news", "main_title": "有版本號的新資料", "main_title_visible": True, "confidence": 0.9}},
+    ]
+    path.write_text("\n".join(json_mod.dumps(l) for l in lines), encoding="utf-8")
+    frames = segment.load_vlm_results(path)
+    assert len(frames) == 1
+    assert frames[0]["main_title"] == "有版本號的新資料"
+
+
+def test_load_vlm_results_same_version_keeps_later_occurrence(tmp_path):
+    import json as json_mod
+    path = tmp_path / "vlm.jsonl"
+    lines = [
+        {"video_second": 5, "prompt_version": 2, "result": {"screen_type": "news", "main_title": "第一次寫入", "main_title_visible": True, "confidence": 0.9}},
+        {"video_second": 5, "prompt_version": 2, "result": {"screen_type": "news", "main_title": "第二次寫入", "main_title_visible": True, "confidence": 0.9}},
+    ]
+    path.write_text("\n".join(json_mod.dumps(l) for l in lines), encoding="utf-8")
+    frames = segment.load_vlm_results(path)
+    assert len(frames) == 1
+    assert frames[0]["main_title"] == "第二次寫入"
+
+
 def test_build_segments_for_channel_end_to_end(tmp_path):
     import json as json_mod
     path = tmp_path / "ftv_vlm.jsonl"

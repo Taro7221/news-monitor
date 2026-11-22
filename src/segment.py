@@ -514,16 +514,30 @@ def call_vlm_judge_same_story(
 # ---------- 整合：單一頻道的分段流程（本機、不呼叫任何 VLM） ----------
 
 def load_vlm_results(path: Path) -> list[dict]:
-    """讀 out/{channel}_vlm.jsonl，攤平成 run_state_machine 需要的欄位，依秒數排序。"""
-    frames = []
+    """讀 out/{channel}_vlm.jsonl，攤平成 run_state_machine 需要的欄位，依秒數排序。
+
+    同一個 video_second 可能因為斷點續跑 + prompt 版本升級，在檔案裡留下好幾筆
+    （舊 prompt 寫的一筆、重跑後新 prompt 又寫一筆）——resume 是用 append 寫檔，
+    不會覆蓋舊的那行。這裡依 prompt_version 取最新的那筆（沒有這個欄位的舊資料
+    版本視為最低），版本相同就取檔案裡較後面出現的那筆，確保不會把同一秒的
+    新舊兩筆都當成獨立樣本重複計算。"""
+    best_by_second: dict[int, tuple[int, dict]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         rec = json.loads(line)
+        second = rec["video_second"]
+        version = rec.get("prompt_version", -1)
+        existing = best_by_second.get(second)
+        if existing is None or version >= existing[0]:
+            best_by_second[second] = (version, rec)
+
+    frames = []
+    for second, (_version, rec) in best_by_second.items():
         result = rec.get("result", {})
         frames.append({
-            "video_second": rec["video_second"],
+            "video_second": second,
             "minute_code": rec.get("minute_code"),
             "screen_type": result.get("screen_type"),
             "main_title": result.get("main_title", ""),
