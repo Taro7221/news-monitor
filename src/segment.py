@@ -723,7 +723,7 @@ def build_fill_events(
     return fill_events
 
 
-DEFAULT_MAX_ITEMS_PER_MINUTE = 2
+DEFAULT_MAX_ITEMS_PER_MINUTE = 1
 DEFAULT_MIN_FRAMES_FOR_SECONDARY = 2
 
 
@@ -748,15 +748,15 @@ def select_dominant_per_minute(
     同分鐘內若有第二則「不同的新聞」（非廣告、讀值數達 min_frames_for_secondary），
     不會用「/」塞進本分鐘，而是取它第一個（video_second 最早）抓到的 bar 原文，
     帶到下一分鐘參與分組——如果下一分鐘本來就有同一則新聞在成長，會自然合併進該組
-    （不會重複顯示）；如果下一分鐘沒有相近的候選，則以獨立一則的身分顯示在下一
-    分鐘（不受 min_frames_for_secondary 限制，因為已經在上一分鐘驗證過是真的有
-    出現、只是比例較低）。只有恰好緊接著的下一個分鐘（minute+1）才會收到這個
-    延後候選；中間若整分鐘沒有任何讀值（資料缺口），則不強行跨越去找更後面的
-    分鐘。
+    （可能因此躍居本分鐘比例最高）；如果下一分鐘沒有相近的候選、追不上下一分鐘
+    自己讀值數最高的候選，就直接捨棄，不會硬塞成下一分鐘的第二格（範本幾乎每格
+    都只有一個五字標，這個候選既然沒能真的在下一分鐘成長/站穩，代表它多半只是
+    過場雜訊）。只有恰好緊接著的下一個分鐘（minute+1）才會收到這個延後候選；
+    中間若整分鐘沒有任何讀值（資料缺口），則不強行跨越去找更後面的分鐘。
 
     回傳 {minute_code: [{"kind": "news"|"ad", "label":, "frame_count":,
-    "confidence":}, ...]}（已依讀值數由高到低排序，一般只有 1 筆，最多
-    max_items_per_minute 筆）。"""
+    "confidence":}, ...]}（已依讀值數由高到低排序；通常只有 1 筆，只有在真的
+    並列第一時才會到 max_items_per_minute 筆）。"""
     frames = load_vlm_results(vlm_results_path)
 
     by_minute: dict[int, list[dict]] = {}
@@ -819,7 +819,15 @@ def select_dominant_per_minute(
         pending_carry = None
 
         groups = _group(by_minute[minute], carry_in)
-        groups.sort(key=lambda g: len(g["members"]), reverse=True)
+
+        def _earliest_second(g: dict) -> int:
+            return min(m.get("video_second", 0) for m in g["members"])
+
+        # 讀值數由高到低；打平時本分鐘「原生」的候選優先於上一分鐘延後帶入、
+        # 沒能合併的候選（延後帶入的候選只有在這一分鐘真的沒有更強的原生內容時
+        # 才會顯示），同樣原生/同樣延後再用「先出現的那個」當決定性的 tiebreak
+        # （範本幾乎每格只有一個五字標，打平時也要選出唯一一個，不能真的留兩個）。
+        groups.sort(key=lambda g: (-len(g["members"]), 1 if g.get("forced") else 0, _earliest_second(g)))
 
         def _as_item(g: dict) -> dict:
             return {
@@ -829,26 +837,16 @@ def select_dominant_per_minute(
                 "confidence": max(m.get("confidence", 1.0) for m in g["members"]),
             }
 
-        primary = groups[0] if groups else None
-        forced_group = next((g for g in groups if g.get("forced")), None)
-
-        chosen = []
-        if primary is not None:
-            chosen.append(_as_item(primary))
-        if (
-            forced_group is not None
-            and forced_group is not primary
-            and len(chosen) < max_items_per_minute
-        ):
-            # 上一分鐘延後帶入、且沒能併進本分鐘任何候選的新聞，直接顯示在本分鐘，
-            # 不受 min_frames_for_secondary 限制（上一分鐘已驗證過真的出現）。
-            chosen.append(_as_item(forced_group))
+        top_count = len(groups[0]["members"]) if groups else 0
+        top_groups = [g for g in groups if len(g["members"]) == top_count]
+        chosen = [_as_item(g) for g in top_groups[:max_items_per_minute]]
         result[minute] = chosen
 
-        # 本分鐘「原生」次要新聞（非強制帶入、非廣告）比例第二高者若達門檻，
-        # 一律不與本分鐘的主要新聞同格顯示，而是延後到下一分鐘。
+        # 排名在並列第一之後、非強制帶入、非廣告的新聞候選，讀值數若達門檻，
+        # 其「第一次出現」的原文延後到下一分鐘；不夠格（或是廣告/剛被強制帶入
+        # 卻沒追上排名）的候選就直接捨棄，不會逐分鐘一直往後遞延。
         for g in groups:
-            if g is primary or g.get("forced") or g["kind"] != "news":
+            if any(g is tg for tg in top_groups) or g.get("forced") or g["kind"] != "news":
                 continue
             if len(g["members"]) < min_frames_for_secondary:
                 continue

@@ -636,10 +636,43 @@ def test_select_dominant_per_minute_defers_minority_to_next_minute(tmp_path):
 
     result = segment.select_dominant_per_minute("ftv", path, min_frames_for_secondary=2)
     assert [g["label"] for g in result[1200]] == ["多數新聞"]
-    # 下一分鐘：自己的主要新聞在前，被延後帶入、沒能合併的次要新聞接在後面
-    assert [g["label"] for g in result[1201]] == ["下一分鐘新聞", "次要新聞"]
-    carried = result[1201][1]
-    assert carried["frame_count"] == 1  # 只帶第一筆讀值
+    # 下一分鐘自己的新聞讀值數（4）比延後帶入、沒能合併的候選（1）多，
+    # 後者被直接捨棄，不會硬塞成下一分鐘的第二格
+    assert [g["label"] for g in result[1201]] == ["下一分鐘新聞"]
+
+
+def test_select_dominant_per_minute_native_wins_tie_over_carried_item(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    # 下一分鐘自己只有 1 筆讀值，跟延後帶入的候選（也是 1 筆）打平——範本每格只有
+    # 一個五字標，打平時一律讓這一分鐘「原生」的候選贏，不會兩個都顯示。
+    records = (
+        [_vlm_rec(i, 1200, title="多數新聞") for i in range(5)]
+        + [_vlm_rec(10 + i, 1200, title="次要新聞") for i in range(2)]
+        + [_vlm_rec(70, 1201, title="下一分鐘新聞")]
+    )
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path, min_frames_for_secondary=2)
+    assert [g["label"] for g in result[1200]] == ["多數新聞"]
+    assert [g["label"] for g in result[1201]] == ["下一分鐘新聞"]
+
+
+def test_select_dominant_per_minute_carried_item_becomes_sole_when_next_minute_otherwise_empty(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    # 下一分鐘完全沒有可用的原生讀值（唯一一筆標題不可見），延後帶入的候選
+    # 就直接成為下一分鐘的唯一內容——這才是「填入下一分鐘」字面上的意思。
+    records = (
+        [_vlm_rec(i, 1200, title="多數新聞") for i in range(5)]
+        + [_vlm_rec(10 + i, 1200, title="次要新聞") for i in range(2)]
+        + [_vlm_rec(70, 1201, title="", visible=False)]
+    )
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path, min_frames_for_secondary=2)
+    assert [g["label"] for g in result[1200]] == ["多數新聞"]
+    assert [g["label"] for g in result[1201]] == ["次要新聞"]
 
 
 def test_select_dominant_per_minute_carried_item_merges_into_next_minutes_dominant(tmp_path):
@@ -678,18 +711,19 @@ def test_select_dominant_per_minute_ad_minority_is_dropped_not_deferred(tmp_path
 def test_select_dominant_per_minute_respects_max_items_per_minute(tmp_path):
     import json as json_mod
     path = tmp_path / "ftv_vlm.jsonl"
+    # 同一分鐘內兩則新聞剛好打平並列第一（都是3筆），max_items_per_minute 控制
+    # 這種真的分不出高下時最多顯示幾個並列候選。
     records = (
-        [_vlm_rec(i, 1200, title="A") for i in range(5)]
+        [_vlm_rec(i, 1200, title="A") for i in range(3)]
         + [_vlm_rec(10 + i, 1200, title="B") for i in range(3)]
-        + [_vlm_rec(70 + i, 1201, title="E") for i in range(3)]
     )
     path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
 
-    result = segment.select_dominant_per_minute(
-        "ftv", path, max_items_per_minute=1, min_frames_for_secondary=2,
-    )
-    # max_items_per_minute=1 時，延後帶入、沒能合併的候選也不會被加進去
-    assert [g["label"] for g in result[1201]] == ["E"]
+    result = segment.select_dominant_per_minute("ftv", path, max_items_per_minute=1)
+    assert [g["label"] for g in result[1200]] == ["A"]
+
+    result2 = segment.select_dominant_per_minute("ftv", path, max_items_per_minute=2)
+    assert [g["label"] for g in result2[1200]] == ["A", "B"]
 
 
 def test_select_dominant_per_minute_ads_collapse_into_one_group_regardless_of_text_noise(tmp_path):
@@ -730,8 +764,10 @@ def test_select_dominant_per_minute_uses_vlm_judge_for_ambiguous(tmp_path):
         "ftv", path, vlm_judge_fn=lambda a, b: False, similarity_fn=fake_similarity,
         min_frames_for_secondary=1,
     )
-    # 判定為不同則之後，次要新聞不再同格顯示，且沒有下一分鐘資料可延後，故消失
+    # 判定為不同則之後，兩則讀值數打平（都只有1筆）；預設 max_items_per_minute=1，
+    # 打平時用先出現的那個當 tiebreak，只會顯示一個
     assert len(split[1200]) == 1
+    assert split[1200][0]["label"] == "標題A"
 
 
 def test_select_dominant_per_minute_vlm_judge_exception_defaults_to_different(tmp_path):
@@ -750,8 +786,9 @@ def test_select_dominant_per_minute_vlm_judge_exception_defaults_to_different(tm
         "ftv", path, vlm_judge_fn=failing_judge, similarity_fn=fake_similarity,
         min_frames_for_secondary=1,
     )
-    # 不應該崩潰；保守當作不同則後，次要新聞一樣延後（此處無下一分鐘資料故消失）
+    # 不應該崩潰；保守當作不同則後，兩則讀值數打平，預設只顯示先出現的那個
     assert len(result[1200]) == 1
+    assert result[1200][0]["label"] == "標題A"
 
 
 def test_select_dominant_per_minute_ignores_frames_without_visible_title(tmp_path):
