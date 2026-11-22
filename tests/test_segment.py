@@ -416,6 +416,64 @@ def test_generate_five_char_label_passes_previous_violations_to_retry():
     assert seen_violations[1] is not None  # 第二次重試有拿到上一次的違規原因
 
 
+def test_generate_five_char_label_previous_violations_include_the_actual_previous_answer():
+    # 不只是「長度不對」這種抽象描述，上一次具體的答案本身也要附上，
+    # 不然這個模型對「請修正」幾乎沒反應（同樣輸入會得到同樣輸出）。
+    # 用「太短」這種補字救不回來的案例，確保一定會真的走到下一次重試
+    # （六個字那種會被 _fit_label_to_length 直接修掉、不會進到下一次重試）。
+    seen_violations = []
+
+    def vlm_fn(title, attempt, prev_violations):
+        seen_violations.append(prev_violations)
+        return "太短" if attempt == 0 else "台北車禍案"
+
+    segment.generate_five_char_label("台北市發生車禍", vlm_fn)
+    assert any("太短" in v for v in seen_violations[1])
+
+
+def test_fit_label_to_length_trims_from_the_tail_to_preserve_leading_proper_noun():
+    # 從前面刪會把專有名詞拆散（「福建艦」變成「建艦」），從尾端刪比較安全
+    result = segment._fit_label_to_length("福建艦強能力", "福建艦入列滿一年 強化艦載機起降等作戰能力")
+    assert result == "福建艦強能"
+
+
+def test_fit_label_to_length_handles_two_character_excess():
+    result = segment._fit_label_to_length("福建艦強大能力", "福建艦入列滿一年 強化艦載機起降等作戰能力")
+    assert result is not None
+    assert len(result) == 5
+    assert result.startswith("福建艦")
+
+
+def test_fit_label_to_length_returns_none_when_already_short_enough():
+    assert segment._fit_label_to_length("太短", "隨便什麼標題") is None
+
+
+def test_fit_label_to_length_returns_none_when_excess_too_large():
+    assert segment._fit_label_to_length("這個標題字數差太多了", "隨便什麼標題") is None
+
+
+def test_fit_label_to_length_falls_back_to_best_effort_when_nothing_fully_validates():
+    # 社會新聞缺地點、而且原標題根本沒有地點可用時，刪字也救不了「缺地點」
+    # 這個規則，但至少要回傳一個長度正確的版本讓呼叫端自己判斷
+    title = "涉助共諜案張俊傑偷渡 船長,5漁工遭押"
+    result = segment._fit_label_to_length("張俊傑偷渡案", title)
+    assert result is not None
+    assert len(result) == 5
+
+
+def test_generate_five_char_label_uses_trimmed_answer_instead_of_falling_back():
+    # 這個模型對「字數不對，請修正」的重試指示幾乎沒反應，同樣的輸入會
+    # 一直給同一個六字答案——與其整個放棄退回關鍵字擷取，應該直接刪字湊數
+    def vlm_fn(title, attempt, prev_violations):
+        return "福建艦強能力"  # 每次都回一樣的六字答案，不管重試幾次
+
+    title = "福建艦入列滿一年 強化艦載機起降等作戰能力"
+    result = segment.generate_five_char_label(title, vlm_fn)
+    assert result["fallback_used"] is False
+    assert result["label"] == "福建艦強能"
+    assert any(a.get("source") == "trimmed" for a in result["attempts"])
+
+
 def test_parse_judge_response_same():
     assert segment.parse_judge_response("same") is True
     assert segment.parse_judge_response("Same.") is True

@@ -24,6 +24,7 @@ main_title, main_title_visible, confidence}}）：
 """
 
 import argparse
+import itertools
 import json
 import sys
 import time
@@ -438,6 +439,38 @@ def _log_low_overlap(title: str, label: str, path: Path) -> None:
         f.write(json.dumps({"title": title, "label": label}, ensure_ascii=False) + "\n")
 
 
+def _fit_label_to_length(label: str, original_title: str, length: int = LABEL_LENGTH) -> Optional[str]:
+    """label 比規定的 length 多出 1~2 個字時，嘗試只刪掉最少的字湊成剛好
+    length 個字，而不是整個放棄、退回去粗暴地從原標題擷取關鍵字——VLM 給的
+    答案通常語意是對的，只是字數沒抓準。優先回傳刪字後「完全合格」（含地點
+    規則）的版本；找不到完全合格的版本，就回傳長度至少對的版本，讓呼叫端
+    自行判斷還有沒有其他違規。
+
+    字數差距超過 2 個字、或 label 太短（無法在不編造新內容的前提下補字）
+    時回傳 None，交給呼叫端走原本的重試/退回路徑。
+
+    刪字順序優先從尾端開始：中文標題/摘要通常把最關鍵的專有名詞（人名、
+    地名、機構名、艦名等）放在前面，後面接描述性的字——從前面刪很容易把
+    專有名詞拆散、讓人認不出是哪個人事物（例如「福建艦強能力」刪成
+    「建艦強能力」就認不出是「福建艦」），從尾端刪通常比較安全。"""
+    excess = len(label) - length
+    if excess <= 0 or excess > 2:
+        return None
+
+    # combinations 是遞增排列（索引小的組合先出現），reversed 之後會先嘗試
+    # 刪掉靠尾端的位置組合，符合「優先從尾端刪」的偏好。
+    candidates_order = list(reversed(list(itertools.combinations(range(len(label)), excess))))
+
+    best_with_remaining_violations: Optional[str] = None
+    for drop_positions in candidates_order:
+        candidate = "".join(ch for i, ch in enumerate(label) if i not in drop_positions)
+        if not validate_five_char_label(candidate, original_title):
+            return candidate
+        if best_with_remaining_violations is None:
+            best_with_remaining_violations = candidate
+    return best_with_remaining_violations
+
+
 def generate_five_char_label(
     title: str,
     vlm_text_fn: Callable[[str, int, Optional[list]], str],
@@ -456,7 +489,17 @@ def generate_five_char_label(
     out/logs/possible_fabrication.jsonl 供事後抽查。"""
     attempts = []
     for attempt in range(max_retries + 1):
-        previous_violations = attempts[-1]["violations"] if attempts else None
+        previous_violations = None
+        if attempts:
+            last = attempts[-1]
+            previous_violations = list(last["violations"])
+            if last["label"]:
+                # 把上一次實際的答案本身也附進去——不然 vlm_text_fn 只拿得到
+                # 「長度不對」這種抽象描述，不知道自己上次具體說了什麼，重試
+                # 時往往會原封不動地重複同一個錯誤答案（溫度設 0，輸入不變就
+                # 會得到一樣的輸出）。附上原文後，retry prompt 才能明確要求
+                # 「從這個答案增減字數」而不是整個重新生成。
+                previous_violations.append(f"上一次的答案是「{last['label']}」（{len(last['label'])}個字）")
         try:
             label = vlm_text_fn(title, attempt, previous_violations)
         except Exception as e:
@@ -476,6 +519,26 @@ def generate_five_char_label(
                 "label": label, "attempts": attempts, "fallback_used": False,
                 "missed_person_name": missed_name,
             }
+
+        # 這個模型對「請修正字數」這種重試指示幾乎沒反應（溫度0、同一組輸入
+        # 會原封不動地重複同一個答案），但它給的答案通常只是多/少個一兩個字、
+        # 語意本身是好的——與其整個丟掉、退回去粗暴地從原標題擷取關鍵字，
+        # 不如直接幫它刪字湊成剛好 5 個字，盡量保留 VLM 已經做好的摘要。
+        if label and len(label) != LABEL_LENGTH:
+            trimmed = _fit_label_to_length(label, title)
+            if trimmed is not None and trimmed != label:
+                trimmed_violations = validate_five_char_label(trimmed, title)
+                attempts.append({"label": trimmed, "violations": trimmed_violations, "source": "trimmed"})
+                if not trimmed_violations:
+                    missed_name = missing_person_name(trimmed, title)
+                    if missed_name:
+                        _log_person_name_missed(title, trimmed, missed_name, person_name_log_path)
+                    if low_overlap_warning(trimmed, title):
+                        _log_low_overlap(title, trimmed, low_overlap_log_path)
+                    return {
+                        "label": trimmed, "attempts": attempts, "fallback_used": False,
+                        "missed_person_name": missed_name,
+                    }
 
     fallback = fallback_keyword_label(title)
     missed_name = missing_person_name(fallback, title)
@@ -557,7 +620,12 @@ def call_vlm_for_label(
     全量批次還在跑、要保留 GPU 資源給它時，不要在這裡接上這個函式。"""
     retry_note = ""
     if previous_violations:
-        retry_note = f"（上一次產生的結果不合格，原因：{'; '.join(previous_violations)}，請修正）\n"
+        retry_note = (
+            f"（上一次產生的結果不合格，原因：{'; '.join(previous_violations)}。"
+            "如果問題只是字數不是剛好5個字，不要整個重新想一個新的五字標——"
+            "直接在上一次的答案裡增字或減字，湊成剛好5個字就好，盡量保留原本的用字；"
+            "如果問題是社會新聞缺地點，才需要換掉內容、放進原標題裡的地點。）\n"
+        )
     prompt = LABEL_PROMPT_TEMPLATE.format(title=title, retry_note=retry_note)
 
     def make_request(current_env: dict) -> str:
