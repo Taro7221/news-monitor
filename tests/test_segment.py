@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -241,6 +242,51 @@ def test_validate_five_char_label_fabricated_content_flagged():
     label = "美國總統訪問"  # 跟原標題完全無關，疑似編造
     violations = segment.validate_five_char_label(label, title)
     assert any("編造" in v for v in violations)
+
+
+def test_extract_person_name_tokens_finds_surname_candidates():
+    tokens = segment.extract_person_name_tokens("沈伯洋蘇巧慧攜手上節目")
+    assert any(t.startswith("沈") for t in tokens)
+    assert any(t.startswith("蘇") for t in tokens)
+
+
+def test_extract_person_name_tokens_empty_when_no_surname():
+    assert segment.extract_person_name_tokens("台積電股價創新高") == []
+
+
+def test_missing_person_name_flags_when_title_has_name_but_label_does_not():
+    missed = segment.missing_person_name("訪談移花接", "沈伯洋訪談被移花接木")
+    assert missed == "沈伯洋"
+
+
+def test_missing_person_name_none_when_label_includes_surname():
+    missed = segment.missing_person_name("沈伯洋訪談", "沈伯洋訪談被移花接木")
+    assert missed is None
+
+
+def test_missing_person_name_none_when_title_has_no_name():
+    assert segment.missing_person_name("台北車禍案", "台北市發生車禍") is None
+
+
+def test_validate_five_char_label_does_not_block_on_missing_person_name():
+    # 人名只是「盡量」，不是硬性規則，缺人名不應該被 validate 擋下來
+    violations = segment.validate_five_char_label("股價創新高", "沈伯洋股價創新高")
+    assert violations == []
+
+
+def test_generate_five_char_label_logs_missed_person_name(tmp_path):
+    def vlm_fn(title, attempt, prev_violations):
+        return "股價創新高"  # 5 個字、通過驗證，但沒有帶到人名「沈伯洋」
+
+    log_path = tmp_path / "person_name_missed.jsonl"
+    result = segment.generate_five_char_label(
+        "沈伯洋股價創新高", vlm_fn, person_name_log_path=log_path,
+    )
+    assert result["fallback_used"] is False
+    assert result["missed_person_name"] == "沈伯洋"
+    assert log_path.exists()
+    logged = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert logged["missed_person_name"] == "沈伯洋"
 
 
 def test_fallback_keyword_label_always_returns_something():
@@ -562,19 +608,71 @@ def test_select_dominant_per_minute_single_item_no_second(tmp_path):
     assert result[1200][0]["frame_count"] == 5
 
 
-def test_select_dominant_per_minute_picks_top_two_by_proportion(tmp_path):
+def test_select_dominant_per_minute_minority_not_shown_same_minute(tmp_path):
     import json as json_mod
     path = tmp_path / "ftv_vlm.jsonl"
+    # 同分鐘內的次要新聞不再用「/」塞進本分鐘，只留比例最高者；
+    # 這裡沒有下一分鐘的資料，次要新聞的延後候選無處可去，直接消失。
     records = (
         [_vlm_rec(i, 1200, title="多數新聞") for i in range(6)]
         + [_vlm_rec(10 + i, 1200, title="次要新聞") for i in range(3)]
-        + [_vlm_rec(20, 1200, title="極少雜訊", conf=0.1)]  # 只有1筆，不應該被列為第二名
+        + [_vlm_rec(20, 1200, title="極少雜訊", conf=0.1)]
     )
     path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
 
     result = segment.select_dominant_per_minute("ftv", path, min_frames_for_secondary=2)
-    labels = [g["label"] for g in result[1200]]
-    assert labels == ["多數新聞", "次要新聞"]  # 依比例排序，雜訊(只有1筆)被排除
+    assert [g["label"] for g in result[1200]] == ["多數新聞"]
+
+
+def test_select_dominant_per_minute_defers_minority_to_next_minute(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = (
+        [_vlm_rec(i, 1200, title="多數新聞") for i in range(5)]
+        + [_vlm_rec(10 + i, 1200, title="次要新聞") for i in range(3)]  # 第一筆在 sec=10
+        + [_vlm_rec(70 + i, 1201, title="下一分鐘新聞") for i in range(4)]
+    )
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path, min_frames_for_secondary=2)
+    assert [g["label"] for g in result[1200]] == ["多數新聞"]
+    # 下一分鐘：自己的主要新聞在前，被延後帶入、沒能合併的次要新聞接在後面
+    assert [g["label"] for g in result[1201]] == ["下一分鐘新聞", "次要新聞"]
+    carried = result[1201][1]
+    assert carried["frame_count"] == 1  # 只帶第一筆讀值
+
+
+def test_select_dominant_per_minute_carried_item_merges_into_next_minutes_dominant(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = (
+        [_vlm_rec(i, 1200, title="多數新聞") for i in range(5)]
+        + [_vlm_rec(10 + i, 1200, title="故事X") for i in range(2)]
+        + [_vlm_rec(70 + i, 1201, title="故事X") for i in range(3)]
+    )
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path, min_frames_for_secondary=2)
+    assert [g["label"] for g in result[1200]] == ["多數新聞"]
+    # 延後帶入的候選跟下一分鐘本來就在長大的同一則新聞合併，不會重複顯示成兩格
+    assert len(result[1201]) == 1
+    assert result[1201][0]["label"] == "故事X"
+    assert result[1201][0]["frame_count"] == 4  # 自己的3筆 + 延後帶入的1筆
+
+
+def test_select_dominant_per_minute_ad_minority_is_dropped_not_deferred(tmp_path):
+    import json as json_mod
+    path = tmp_path / "ftv_vlm.jsonl"
+    records = (
+        [_vlm_rec(i, 1200, title="多數新聞") for i in range(5)]
+        + [_vlm_rec(10 + i, 1200, screen_type="full_ad", title="", visible=False) for i in range(3)]
+        + [_vlm_rec(70 + i, 1201, title="下一分鐘新聞") for i in range(2)]
+    )
+    path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
+
+    result = segment.select_dominant_per_minute("ftv", path, min_frames_for_secondary=2)
+    assert [g["label"] for g in result[1200]] == ["多數新聞"]
+    assert [g["label"] for g in result[1201]] == ["下一分鐘新聞"]  # 廣告的次要候選不會被帶過去
 
 
 def test_select_dominant_per_minute_respects_max_items_per_minute(tmp_path):
@@ -582,14 +680,16 @@ def test_select_dominant_per_minute_respects_max_items_per_minute(tmp_path):
     path = tmp_path / "ftv_vlm.jsonl"
     records = (
         [_vlm_rec(i, 1200, title="A") for i in range(5)]
-        + [_vlm_rec(10 + i, 1200, title="B") for i in range(4)]
-        + [_vlm_rec(20 + i, 1200, title="C") for i in range(3)]
+        + [_vlm_rec(10 + i, 1200, title="B") for i in range(3)]
+        + [_vlm_rec(70 + i, 1201, title="E") for i in range(3)]
     )
     path.write_text("\n".join(json_mod.dumps(r) for r in records), encoding="utf-8")
 
-    result = segment.select_dominant_per_minute("ftv", path, max_items_per_minute=2)
-    assert len(result[1200]) == 2
-    assert [g["label"] for g in result[1200]] == ["A", "B"]
+    result = segment.select_dominant_per_minute(
+        "ftv", path, max_items_per_minute=1, min_frames_for_secondary=2,
+    )
+    # max_items_per_minute=1 時，延後帶入、沒能合併的候選也不會被加進去
+    assert [g["label"] for g in result[1201]] == ["E"]
 
 
 def test_select_dominant_per_minute_ads_collapse_into_one_group_regardless_of_text_noise(tmp_path):
@@ -630,7 +730,8 @@ def test_select_dominant_per_minute_uses_vlm_judge_for_ambiguous(tmp_path):
         "ftv", path, vlm_judge_fn=lambda a, b: False, similarity_fn=fake_similarity,
         min_frames_for_secondary=1,
     )
-    assert len(split[1200]) == 2
+    # 判定為不同則之後，次要新聞不再同格顯示，且沒有下一分鐘資料可延後，故消失
+    assert len(split[1200]) == 1
 
 
 def test_select_dominant_per_minute_vlm_judge_exception_defaults_to_different(tmp_path):
@@ -649,7 +750,8 @@ def test_select_dominant_per_minute_vlm_judge_exception_defaults_to_different(tm
         "ftv", path, vlm_judge_fn=failing_judge, similarity_fn=fake_similarity,
         min_frames_for_secondary=1,
     )
-    assert len(result[1200]) == 2  # 不應該崩潰，保守當作不同則
+    # 不應該崩潰；保守當作不同則後，次要新聞一樣延後（此處無下一分鐘資料故消失）
+    assert len(result[1200]) == 1
 
 
 def test_select_dominant_per_minute_ignores_frames_without_visible_title(tmp_path):

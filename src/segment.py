@@ -68,6 +68,16 @@ TAIWAN_PLACE_NAMES = [
     "金門", "連江", "汐止", "三重", "板橋", "中壢",
 ]
 
+# 常見姓氏，用來抓標題裡像人名的片段（簡化版，非精確 NER）。地點是硬性規則
+# （社會新聞一定要帶），人名只是「有出現就盡量填上」的加分項，不當硬性擋關卡。
+PERSON_SURNAMES = [
+    "蘇", "李", "沈", "柯", "賴", "藍", "張", "韓", "王", "陳", "林", "黃", "吳",
+    "劉", "楊", "周", "許", "鄭", "謝", "郭", "洪", "曾", "廖", "徐", "余", "潘",
+    "杜", "馬", "方", "彭", "曹", "董", "蕭", "蔡", "康", "邱", "施", "羅", "高",
+    "梁", "宋", "唐", "孫", "胡", "朱", "阮", "任", "熊", "游", "卓", "范", "顏",
+    "簡", "江", "侯", "連", "錢", "尹", "魏", "盧", "白", "石", "秦", "姚", "韋",
+]
+
 
 def default_similarity(a: str, b: str) -> float:
     """0~100，100 代表完全相同。"""
@@ -311,6 +321,39 @@ def extract_location_tokens(text: str) -> list[str]:
     return tokens
 
 
+def _is_chinese_char(ch: str) -> bool:
+    return "一" <= ch <= "鿿"
+
+
+def extract_person_name_tokens(text: str) -> list[str]:
+    """抓文字裡像人名的片段：姓氏開頭往後取 2~3 個中文字當候選。簡單規則版，
+    非精確 NER，只用來做「有出現人名就盡量填進五字標」的 best-effort 判斷。"""
+    tokens: list[str] = []
+    for i, ch in enumerate(text):
+        if ch not in PERSON_SURNAMES:
+            continue
+        for name_len in (3, 2):
+            if i + name_len > len(text):
+                continue
+            candidate = text[i:i + name_len]
+            if all(_is_chinese_char(c) for c in candidate):
+                tokens.append(candidate)
+                break
+    return tokens
+
+
+def missing_person_name(label: str, original_title: str) -> Optional[str]:
+    """回傳原標題裡偵測到、但五字標完全沒帶到的人名候選（取第一個）；
+    原標題沒有可辨識的人名、或五字標已經帶到（哪怕只有姓）就回傳 None。
+    這不是 validate_five_char_label 的硬性規則——人名是「盡量」而非「一定要」，
+    只用來記錄到 out/logs 供事後檢查。"""
+    for name in extract_person_name_tokens(original_title):
+        if any(ch in label for ch in name):
+            return None
+        return name
+    return None
+
+
 def validate_five_char_label(label: str, original_title: str) -> list[str]:
     """回傳違反的規則清單；空清單代表通過。"""
     violations = []
@@ -345,14 +388,31 @@ def fallback_keyword_label(title: str, length: int = LABEL_LENGTH) -> str:
     return cleaned[:length]
 
 
+PERSON_NAME_LOG_PATH = OUT_DIR / "logs" / "person_name_missed.jsonl"
+
+
+def _log_person_name_missed(title: str, label: str, missed_name: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(
+            {"title": title, "label": label, "missed_person_name": missed_name},
+            ensure_ascii=False,
+        ) + "\n")
+
+
 def generate_five_char_label(
     title: str,
     vlm_text_fn: Callable[[str, int, Optional[list]], str],
     max_retries: int = LABEL_MAX_RETRIES,
+    person_name_log_path: Path = PERSON_NAME_LOG_PATH,
 ) -> dict:
     """vlm_text_fn(title, attempt, previous_violations) -> 候選五字標字串。
     介面已就緒，但呼叫端要自己決定什麼時候真的接上會打網路的實作（見
-    call_vlm_for_label），不要在批次抽幀/偵測還在跑、搶 GPU 資源時呼叫。"""
+    call_vlm_for_label），不要在批次抽幀/偵測還在跑、搶 GPU 資源時呼叫。
+
+    地點是硬性規則（validate_five_char_label 會擋），人名只是「有出現就盡量
+    填上」，不會因為漏掉人名就重試或判定失敗，但會記錄到
+    out/logs/person_name_missed.jsonl 供事後檢查。"""
     attempts = []
     for attempt in range(max_retries + 1):
         previous_violations = attempts[-1]["violations"] if attempts else None
@@ -366,10 +426,22 @@ def generate_five_char_label(
         violations = validate_five_char_label(label, title)
         attempts.append({"label": label, "violations": violations})
         if not violations:
-            return {"label": label, "attempts": attempts, "fallback_used": False}
+            missed_name = missing_person_name(label, title)
+            if missed_name:
+                _log_person_name_missed(title, label, missed_name, person_name_log_path)
+            return {
+                "label": label, "attempts": attempts, "fallback_used": False,
+                "missed_person_name": missed_name,
+            }
 
     fallback = fallback_keyword_label(title)
-    return {"label": fallback, "attempts": attempts, "fallback_used": True}
+    missed_name = missing_person_name(fallback, title)
+    if missed_name:
+        _log_person_name_missed(title, fallback, missed_name, person_name_log_path)
+    return {
+        "label": fallback, "attempts": attempts, "fallback_used": True,
+        "missed_person_name": missed_name,
+    }
 
 
 LABEL_PROMPT_TEMPLATE = """你是新聞監看五字標產生器。根據下面的新聞標題，產生一個「五字標」摘要：
@@ -379,7 +451,9 @@ LABEL_PROMPT_TEMPLATE = """你是新聞監看五字標產生器。根據下面�
 規則：
 - 剛好 5 個中文字（不要標點、不要英數字，除非原標題本身就是英數字內容）。
 - 只能用原標題裡實際出現過的地點、人物、動作來摘要，不可以自己編造標題沒寫的地點或動作。
-- 如果是社會新聞（車禍、刑案、意外等），五字標要帶地點。
+- 如果是社會新聞（車禍、刑案、意外等），五字標「一定要」帶地點，這是最優先的規則。
+- 如果原標題有出現人名，在不犧牲地點（若必要）的前提下，也「盡量」把人名放進五字標；
+  五字空間有限、兩者衝突時，地點優先。
 {retry_note}
 只回傳五字標本身，不要加任何說明文字。"""
 
@@ -663,19 +737,26 @@ def select_dominant_per_minute(
     max_items_per_minute: int = DEFAULT_MAX_ITEMS_PER_MINUTE,
     min_frames_for_secondary: int = DEFAULT_MIN_FRAMES_FOR_SECONDARY,
 ) -> dict[int, list[dict]]:
-    """給 fill.py 用：範本實際上幾乎每格只有一個五字標，帶斜線的多半是人工誤植，
-    所以不要「每個換則事件都塞進去用/相連」，改成每一分鐘直接統計這一分鐘內
+    """給 fill.py 用：範本實際上幾乎每格只有一個五字標，所以每一分鐘只統計這一分鐘內
     （不分事件邊界，整分鐘所有 heartbeat/event 讀值）各候選的「比例」
-    （= 支持的讀值筆數），只留比例最高的最多 max_items_per_minute 個：
+    （= 支持的讀值筆數），比例最高者留在本分鐘：
     - 廣告（screen_type 是 full_ad/ad_wrap）一律算同一組，輸出「廣告」，不會因為
       偶爾文字不同就被拆成好幾個廣告候選。
     - 新聞讀值依文字相似度（模糊地帶可用 vlm_judge_fn）分組，組內讀值數最多的
       字串當代表。
-    - 第二名要有至少 min_frames_for_secondary 筆讀值支持才會被列進來，避免單一
-      雜訊幀也被當成「這分鐘另一則新聞」。
+
+    同分鐘內若有第二則「不同的新聞」（非廣告、讀值數達 min_frames_for_secondary），
+    不會用「/」塞進本分鐘，而是取它第一個（video_second 最早）抓到的 bar 原文，
+    帶到下一分鐘參與分組——如果下一分鐘本來就有同一則新聞在成長，會自然合併進該組
+    （不會重複顯示）；如果下一分鐘沒有相近的候選，則以獨立一則的身分顯示在下一
+    分鐘（不受 min_frames_for_secondary 限制，因為已經在上一分鐘驗證過是真的有
+    出現、只是比例較低）。只有恰好緊接著的下一個分鐘（minute+1）才會收到這個
+    延後候選；中間若整分鐘沒有任何讀值（資料缺口），則不強行跨越去找更後面的
+    分鐘。
 
     回傳 {minute_code: [{"kind": "news"|"ad", "label":, "frame_count":,
-    "confidence":}, ...]}（已依讀值數由高到低排序）。"""
+    "confidence":}, ...]}（已依讀值數由高到低排序，一般只有 1 筆，最多
+    max_items_per_minute 筆）。"""
     frames = load_vlm_results(vlm_results_path)
 
     by_minute: dict[int, list[dict]] = {}
@@ -685,8 +766,7 @@ def select_dominant_per_minute(
             continue
         by_minute.setdefault(minute, []).append(f)
 
-    result: dict[int, list[dict]] = {}
-    for minute, minute_frames in by_minute.items():
+    def _group(minute_frames: list[dict], carry_in: Optional[dict]) -> list[dict]:
         ad_frames = [f for f in minute_frames if f["screen_type"] in AD_SCREEN_TYPES]
         news_frames = [
             f for f in minute_frames
@@ -695,10 +775,9 @@ def select_dominant_per_minute(
 
         groups: list[dict] = []
         if ad_frames:
-            groups.append({"kind": "ad", "label": "廣告", "members": ad_frames})
+            groups.append({"kind": "ad", "label": "廣告", "members": list(ad_frames), "forced": False})
 
-        for f in news_frames:
-            placed = False
+        def _place(f: dict) -> bool:
             for g in groups:
                 if g["kind"] != "news":
                     continue
@@ -717,24 +796,66 @@ def select_dominant_per_minute(
                     same = False
                 if same:
                     g["members"].append(f)
-                    placed = True
-                    break
-            if not placed:
-                groups.append({"kind": "news", "label": f["main_title"], "members": [f]})
+                    return True
+            return False
 
+        for f in news_frames:
+            if not _place(f):
+                groups.append({"kind": "news", "label": f["main_title"], "members": [f], "forced": False})
+
+        if carry_in is not None and not _place(carry_in):
+            groups.append({
+                "kind": "news", "label": carry_in["main_title"], "members": [carry_in], "forced": True,
+            })
+
+        return groups
+
+    minutes_sorted = sorted(by_minute)
+    result: dict[int, list[dict]] = {}
+    pending_carry: Optional[dict] = None
+    prev_minute: Optional[int] = None
+    for minute in minutes_sorted:
+        carry_in = pending_carry if prev_minute is not None and minute == prev_minute + 1 else None
+        pending_carry = None
+
+        groups = _group(by_minute[minute], carry_in)
         groups.sort(key=lambda g: len(g["members"]), reverse=True)
 
-        chosen = []
-        for i, g in enumerate(groups[:max_items_per_minute]):
-            if i >= 1 and len(g["members"]) < min_frames_for_secondary:
-                break
-            chosen.append({
+        def _as_item(g: dict) -> dict:
+            return {
                 "kind": g["kind"],
                 "label": g["label"],
                 "frame_count": len(g["members"]),
                 "confidence": max(m.get("confidence", 1.0) for m in g["members"]),
-            })
+            }
+
+        primary = groups[0] if groups else None
+        forced_group = next((g for g in groups if g.get("forced")), None)
+
+        chosen = []
+        if primary is not None:
+            chosen.append(_as_item(primary))
+        if (
+            forced_group is not None
+            and forced_group is not primary
+            and len(chosen) < max_items_per_minute
+        ):
+            # 上一分鐘延後帶入、且沒能併進本分鐘任何候選的新聞，直接顯示在本分鐘，
+            # 不受 min_frames_for_secondary 限制（上一分鐘已驗證過真的出現）。
+            chosen.append(_as_item(forced_group))
         result[minute] = chosen
+
+        # 本分鐘「原生」次要新聞（非強制帶入、非廣告）比例第二高者若達門檻，
+        # 一律不與本分鐘的主要新聞同格顯示，而是延後到下一分鐘。
+        for g in groups:
+            if g is primary or g.get("forced") or g["kind"] != "news":
+                continue
+            if len(g["members"]) < min_frames_for_secondary:
+                continue
+            pending_carry = min(g["members"], key=lambda m: m.get("video_second", 0))
+            break
+
+        prev_minute = minute
 
     return result
 
