@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>新聞監看自動填表 - 測試 Demo</title>
+<style>
+  body { font-family: "Microsoft JhengHei", "PingFang TC", sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 20px; }
+  p.hint { color: #666; font-size: 13px; line-height: 1.6; }
+  fieldset { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  legend { font-weight: bold; padding: 0 6px; }
+  .channel-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .channel-row label { width: 90px; font-weight: bold; }
+  .channel-row input[type=file] { flex: 1; }
+  .row { display: flex; gap: 16px; margin-bottom: 12px; }
+  .row label { display: block; font-size: 13px; color: #444; margin-bottom: 4px; }
+  input[type=text], input[type=number] { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; width: 160px; }
+  button { background: #2b6cb0; color: #fff; border: none; border-radius: 6px; padding: 10px 20px; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  button.secondary { background: #38a169; }
+  #status-box { display: none; margin-top: 24px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+  th, td { border: 1px solid #ddd; padding: 8px 10px; text-align: left; font-size: 13px; }
+  th { background: #f7f7f7; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
+  .badge.not_uploaded { background: #ccc; color: #666; }
+  .badge.queued { background: #d69e2e; }
+  .badge.processing { background: #3182ce; }
+  .badge.done { background: #38a169; }
+  .badge.error { background: #e53e3e; }
+  #error-box { color: #c0392b; margin-top: 10px; display: none; }
+</style>
+</head>
+<body>
+  <h1>新聞監看自動填表 — 測試 Demo</h1>
+  <p class="hint">
+    上傳四台（或任一台）的側錄影片，系統會依序（目前一次處理一台）自動判讀標題、產生五字標，並填入「12監看」範本。
+    不用等四台都跑完，隨時可以按「立即輸出」下載目前已完成頻道的 Excel。<br>
+    影片愈長（整小時）處理愈久，一台大約數分鐘到十幾分鐘，請耐心等候或先用「測試用：只處理前幾分鐘」加速 demo。
+  </p>
+
+  <form id="upload-form">
+    <fieldset>
+      <legend>上傳影片（檔名不限，用欄位對應頻道）</legend>
+      {% for ch in channels %}
+      <div class="channel-row">
+        <label for="file-{{ ch }}">{{ labels[ch] }}</label>
+        <input type="file" id="file-{{ ch }}" name="{{ ch }}" accept="video/*">
+      </div>
+      {% endfor %}
+    </fieldset>
+
+    <fieldset>
+      <legend>監看設定</legend>
+      <div class="row">
+        <div>
+          <label for="date">監看日期（預設今天，影片視為當天 12:00 開始）</label>
+          <input type="text" id="date" name="date" placeholder="YYYY-MM-DD">
+        </div>
+        <div>
+          <label for="duration">測試用：只處理前幾分鐘（留空＝整支影片）</label>
+          <input type="number" id="duration" name="duration_minutes" min="1" placeholder="例如 15">
+        </div>
+      </div>
+    </fieldset>
+
+    <button type="submit" id="submit-btn">開始處理</button>
+  </form>
+
+  <div id="error-box"></div>
+
+  <div id="status-box">
+    <h2>處理進度</h2>
+    <table>
+      <thead><tr><th>頻道</th><th>狀態</th><th>目前階段</th></tr></thead>
+      <tbody id="status-body"></tbody>
+    </table>
+    <div style="margin-top: 16px;">
+      <button class="secondary" id="download-btn" disabled>立即輸出 Excel（下載目前已完成的部分）</button>
+    </div>
+  </div>
+
+<script>
+const CHANNEL_LABELS = {{ labels | tojson }};
+let currentJobId = null;
+let pollTimer = null;
+
+document.getElementById("upload-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const data = new FormData(form);
+  const submitBtn = document.getElementById("submit-btn");
+  const errorBox = document.getElementById("error-box");
+  errorBox.style.display = "none";
+  submitBtn.disabled = true;
+  submitBtn.textContent = "上傳中…（大檔案可能需要一些時間）";
+
+  try {
+    const resp = await fetch("/api/upload", { method: "POST", body: data });
+    const body = await resp.json();
+    if (!resp.ok) {
+      throw new Error(body.error || "上傳失敗");
+    }
+    currentJobId = body.job_id;
+    document.getElementById("status-box").style.display = "block";
+    startPolling();
+  } catch (err) {
+    errorBox.textContent = "錯誤：" + err.message;
+    errorBox.style.display = "block";
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = "開始處理";
+  }
+});
+
+document.getElementById("download-btn").addEventListener("click", () => {
+  if (currentJobId) {
+    window.location = `/api/jobs/${currentJobId}/download`;
+  }
+});
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(refreshStatus, 3000);
+  refreshStatus();
+}
+
+async function refreshStatus() {
+  if (!currentJobId) return;
+  const resp = await fetch(`/api/jobs/${currentJobId}/status`);
+  if (!resp.ok) return;
+  const data = await resp.json();
+
+  const tbody = document.getElementById("status-body");
+  tbody.innerHTML = "";
+  for (const ch of Object.keys(data.channels)) {
+    const info = data.channels[ch];
+    const tr = document.createElement("tr");
+    const stage = info.stage || (info.status === "done" ? "完成" : info.status === "error" ? (info.error || "失敗") : "-");
+    tr.innerHTML = `<td>${CHANNEL_LABELS[ch]}</td><td><span class="badge ${info.status}">${info.status}</span></td><td>${stage}</td>`;
+    tbody.appendChild(tr);
+  }
+
+  document.getElementById("download-btn").disabled = !data.excel_ready;
+
+  if (data.all_done && pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+</script>
+</body>
+</html>

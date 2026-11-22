@@ -10,4 +10,5 @@ pyyaml
 tqdm
 rapidfuzz
 pytest
+flask
 # librosa  # optional: enable if audio analysis is needed
