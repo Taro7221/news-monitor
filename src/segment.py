@@ -376,11 +376,29 @@ def validate_five_char_label(label: str, original_title: str) -> list[str]:
     return violations
 
 
+CLAUSE_SEPARATORS = set("!?！？,，。；;")
+
+
 def fallback_keyword_label(title: str, length: int = LABEL_LENGTH) -> str:
-    """決定性退路（不呼叫 VLM）：從原標題去掉標點符號後取前 length 個字，
-    保證一定有輸出，不受 VLM 可用性影響。"""
+    """決定性退路（不呼叫 VLM）：原標題常常是「起因/背景」+「後續發展/衝突/
+    結果」的複合句，單純取最前面 length 個字容易只摘到背景（例如「想買單口味
+    涼圓，店家不賣爆口角肉身擋車」會變成「想買單口味」，漏掉真正的衝突）。
+    這裡優先找第一個分句標點（！？，。；等），取它後面的 length 個字；分句
+    後剩下的字不夠長（例如分句點根本就在標題結尾附近）就放棄、改回從頭取。
+    去掉標點符號，保證一定有輸出，不受 VLM 可用性影響。"""
     strip_chars = set('!?！？"\'“”.,，。、:：;；()（）- /\\\n\t ')
-    cleaned = "".join(ch for ch in title if ch not in strip_chars)
+
+    def clean(s: str) -> str:
+        return "".join(ch for ch in s if ch not in strip_chars)
+
+    for i, ch in enumerate(title):
+        if ch in CLAUSE_SEPARATORS:
+            after = clean(title[i + 1:])
+            if len(after) >= length:
+                return after[:length]
+            break  # 只看第一個分句點；分句後字數不夠就不用再往後找
+
+    cleaned = clean(title)
     if not cleaned:
         return title[:length].ljust(length, "　")
     if len(cleaned) < length:
@@ -451,6 +469,10 @@ LABEL_PROMPT_TEMPLATE = """你是新聞監看五字標產生器。根據下面�
 規則：
 - 剛好 5 個中文字（不要標點、不要英數字，除非原標題本身就是英數字內容）。
 - 只能用原標題裡實際出現過的地點、人物、動作來摘要，不可以自己編造標題沒寫的地點或動作。
+- 原標題常常是「起因/背景」+「後續發展/衝突/結果」的複合句（例如「想買單口味
+  涼圓，店家不賣爆口角肉身擋車」：前半句只是背景，後半句「爆口角」「肉身擋車」
+  才是真正讓這則新聞成為新聞的重點）。摘要時優先濃縮**後半段真正發生的事件/
+  衝突/結果**，不要只摘要前面的起因或背景，除非原標題根本沒有後續發展可摘要。
 - 如果是社會新聞（車禍、刑案、意外等），五字標「一定要」帶地點，這是最優先的規則。
 - 如果原標題有出現人名，在不犧牲地點（若必要）的前提下，也「盡量」把人名放進五字標；
   五字空間有限、兩者衝突時，地點優先。
@@ -854,6 +876,71 @@ def select_dominant_per_minute(
             break
 
         prev_minute = minute
+
+    return result
+
+
+def mark_continuations_blank(
+    minute_groups: dict[int, list[dict]],
+    vlm_judge_fn: Optional[Callable[[str, str], bool]] = None,
+    similarity_fn: Callable[[str, str], float] = default_similarity,
+    high_threshold: float = MERGE_HIGH_THRESHOLD,
+) -> dict[int, list[dict]]:
+    """給 fill.py 用：select_dominant_per_minute 對每一分鐘是獨立選代表候選的，
+    同一則新聞橫跨好幾分鐘時，bar 文字常常字字句句都在換（同一事件換個角度/
+    子標題），各分鐘各自轉出來的五字標看起來會像一直冒出新新聞，但其實只是
+    前一分鐘的延續——範本的慣例是「同則延續」留白、換則才填（見
+    docs/template_spec.md）。這裡把「跟最近一次真正顯示內容是同一則」的分鐘
+    改成空清單，build_cell_plan 看到空清單會直接跳過該列（維持留白），呼叫端
+    不用再處理，也省了這些分鐘的五字標 VLM 呼叫。
+
+    同一則的判斷：廣告 vs 廣告一律算同一則；廣告 vs 新聞（或反過來）一律算
+    不同；新聞 vs 新聞先看文字相似度，>= high_threshold 直接判同一則，否則
+    只要有給 vlm_judge_fn 就一定問它做語意判斷（這裡跟 select_dominant_per_minute
+    內部分組不同——那邊一分鐘要比對很多幀，只在模糊地帶才問以控制呼叫量；
+    這裡一個分鐘只問一次，划算去抓「文字變很多但其實是同一個深度報導」的
+    情況）；沒有 vlm_judge_fn 時保守判定不同則，避免在沒有語意判斷能力時
+    誤判留白蓋掉真正的新內容。
+
+    中間遇到完全沒有候選的分鐘（空清單，例如沒讀到任何有效讀值）原樣跳過、
+    不會更新「最近一次真正顯示的內容」，讓資料缺口之後的分鐘還是能正確跟
+    缺口前最後顯示的內容比較。"""
+    result: dict[int, list[dict]] = {}
+    last_shown_kind: Optional[str] = None
+    last_shown_label: Optional[str] = None
+
+    for minute in sorted(minute_groups):
+        groups = minute_groups[minute]
+        if not groups:
+            result[minute] = []
+            continue
+
+        primary = groups[0]
+        current_kind = primary["kind"]
+        current_label = primary["label"]
+
+        if last_shown_kind is None or current_kind != last_shown_kind:
+            is_continuation = False
+        elif current_kind == "ad":
+            is_continuation = True
+        else:
+            score = similarity_fn(last_shown_label, current_label)
+            if score >= high_threshold:
+                is_continuation = True
+            elif vlm_judge_fn is not None:
+                try:
+                    is_continuation = vlm_judge_fn(last_shown_label, current_label)
+                except Exception:
+                    is_continuation = False
+            else:
+                is_continuation = False
+
+        if is_continuation:
+            result[minute] = []
+        else:
+            result[minute] = groups
+            last_shown_kind = current_kind
+            last_shown_label = current_label
 
     return result
 

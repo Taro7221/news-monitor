@@ -302,6 +302,19 @@ def test_fallback_keyword_label_strips_punctuation():
     assert "！" not in result
 
 
+def test_fallback_keyword_label_prefers_clause_after_first_separator():
+    # 前半句只是背景（想買涼圓），後半句才是真正的新聞重點（爆口角、肉身擋車）
+    title = '想買"單口味"涼圓！店家不賣爆口角肉身擋車'
+    result = segment.fallback_keyword_label(title)
+    assert result == "店家不賣爆"
+
+
+def test_fallback_keyword_label_falls_back_to_prefix_when_clause_too_short():
+    # 分句點在標題接近結尾處，分句後剩下的字不夠 5 個，改回從頭取
+    result = segment.fallback_keyword_label('"台積電"大漲！創新高')
+    assert result == "台積電大漲"
+
+
 def test_generate_five_char_label_accepts_first_valid_attempt():
     def vlm_fn(title, attempt, prev_violations):
         return "台北車禍案"
@@ -805,6 +818,97 @@ def test_select_dominant_per_minute_ignores_frames_without_visible_title(tmp_pat
     assert len(result[1200]) == 1
     assert result[1200][0]["label"] == "唯一新聞"
     assert result[1200][0]["frame_count"] == 1
+
+
+def _item(kind="news", label="甲", frame_count=1, confidence=0.9):
+    return {"kind": kind, "label": label, "frame_count": frame_count, "confidence": confidence}
+
+
+def test_mark_continuations_blank_collapses_identical_ad_runs():
+    minute_groups = {
+        1200: [_item(kind="ad", label="廣告")],
+        1201: [_item(kind="ad", label="廣告")],
+        1202: [_item(kind="news", label="甲則新聞")],
+    }
+    result = segment.mark_continuations_blank(minute_groups)
+    assert result[1200] == minute_groups[1200]
+    assert result[1201] == []  # 廣告延續，留白
+    assert result[1202] == minute_groups[1202]
+
+
+def test_mark_continuations_blank_keeps_different_news_shown():
+    minute_groups = {
+        1200: [_item(label="甲則新聞")],
+        1201: [_item(label="完全不同的乙則新聞內容")],
+    }
+    result = segment.mark_continuations_blank(minute_groups)
+    assert result[1200] == minute_groups[1200]
+    assert result[1201] == minute_groups[1201]  # 不同則，照樣顯示
+
+
+def test_mark_continuations_blank_blanks_high_similarity_news():
+    minute_groups = {
+        1200: [_item(label="台北市車禍一人送醫")],
+        1201: [_item(label="台北市車禍一人送醫院")],  # 幾乎一樣，只差一個字
+    }
+    result = segment.mark_continuations_blank(minute_groups)
+    assert result[1200] == minute_groups[1200]
+    assert result[1201] == []
+
+
+def test_mark_continuations_blank_consults_judge_for_low_similarity_pair():
+    minute_groups = {
+        1200: [_item(label="福建艦入列滿一年 強化艦載起降能力")],
+        1201: [_item(label="福建艦配航母五件套 可制空打擊預警反潛")],
+    }
+    result_same = segment.mark_continuations_blank(minute_groups, vlm_judge_fn=lambda a, b: True)
+    assert result_same[1201] == []
+
+    result_diff = segment.mark_continuations_blank(minute_groups, vlm_judge_fn=lambda a, b: False)
+    assert result_diff[1201] == minute_groups[1201]
+
+
+def test_mark_continuations_blank_without_judge_defaults_to_different():
+    minute_groups = {
+        1200: [_item(label="福建艦入列滿一年 強化艦載起降能力")],
+        1201: [_item(label="福建艦配航母五件套 可制空打擊預警反潛")],
+    }
+    result = segment.mark_continuations_blank(minute_groups)
+    assert result[1201] == minute_groups[1201]
+
+
+def test_mark_continuations_blank_judge_exception_defaults_to_different():
+    minute_groups = {
+        1200: [_item(label="福建艦入列滿一年 強化艦載起降能力")],
+        1201: [_item(label="福建艦配航母五件套 可制空打擊預警反潛")],
+    }
+
+    def failing_judge(a, b):
+        raise RuntimeError("boom")
+
+    result = segment.mark_continuations_blank(minute_groups, vlm_judge_fn=failing_judge)
+    assert result[1201] == minute_groups[1201]
+
+
+def test_mark_continuations_blank_ad_then_news_always_shown():
+    minute_groups = {
+        1200: [_item(kind="ad", label="廣告")],
+        1201: [_item(kind="news", label="甲則新聞")],
+    }
+    result = segment.mark_continuations_blank(minute_groups)
+    assert result[1201] == minute_groups[1201]
+
+
+def test_mark_continuations_blank_gap_does_not_reset_anchor():
+    minute_groups = {
+        1200: [_item(label="台北市車禍一人送醫")],
+        1201: [],  # 資料缺口，沒有任何候選
+        1202: [_item(label="台北市車禍一人送醫院")],  # 應該還是跟 1200 比對，判同一則
+    }
+    result = segment.mark_continuations_blank(minute_groups)
+    assert result[1200] == minute_groups[1200]
+    assert result[1201] == []
+    assert result[1202] == []
 
 
 def test_build_segments_for_channel_logs_low_confidence(tmp_path):

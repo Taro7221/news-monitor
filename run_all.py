@@ -71,7 +71,8 @@ def run_fill(channels: list[str], tag: str, output_path: str, use_vlm_labels: bo
         if not vlm_path.exists():
             print(f"[skip] {vlm_path} 不存在")
             continue
-        channels_minute_groups[ch] = segment.select_dominant_per_minute(ch, vlm_path, vlm_judge_fn=vlm_judge_fn)
+        minute_groups = segment.select_dominant_per_minute(ch, vlm_path, vlm_judge_fn=vlm_judge_fn)
+        channels_minute_groups[ch] = segment.mark_continuations_blank(minute_groups, vlm_judge_fn=vlm_judge_fn)
 
     vlm_text_fn = None
     if use_vlm_labels:
