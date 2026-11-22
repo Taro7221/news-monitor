@@ -470,6 +470,20 @@ def test_load_vlm_results_same_version_keeps_later_occurrence(tmp_path):
     assert frames[0]["main_title"] == "第二次寫入"
 
 
+def test_load_vlm_results_skips_malformed_lines_missing_video_second(tmp_path, capsys):
+    import json as json_mod
+    path = tmp_path / "vlm.jsonl"
+    lines = [
+        {"video_second": 0, "result": {"screen_type": "news", "main_title": "正常那筆", "main_title_visible": True, "confidence": 0.9}},
+        {"result": {"screen_type": "news", "main_title": "壞掉缺video_second", "main_title_visible": True, "confidence": 0.9}},
+    ]
+    path.write_text("\n".join(json_mod.dumps(l) for l in lines), encoding="utf-8")
+    frames = segment.load_vlm_results(path)
+    assert len(frames) == 1
+    assert frames[0]["main_title"] == "正常那筆"
+    assert "跳過" in capsys.readouterr().out
+
+
 def test_build_segments_for_channel_end_to_end(tmp_path):
     import json as json_mod
     path = tmp_path / "ftv_vlm.jsonl"

@@ -527,7 +527,12 @@ def load_vlm_results(path: Path) -> list[dict]:
         if not line:
             continue
         rec = json.loads(line)
-        second = rec["video_second"]
+        second = rec.get("video_second")
+        if second is None:
+            # 理論上不該發生（例如快取命中卻沒帶 extra_meta 寫壞的舊資料），
+            # 但寧可跳過這一行、印警告，也不要讓整批分段因為一行壞資料而崩潰
+            print(f"[warn] load_vlm_results: 跳過缺少 video_second 的壞資料行：{rec!r}")
+            continue
         version = rec.get("prompt_version", -1)
         existing = best_by_second.get(second)
         if existing is None or version >= existing[0]:

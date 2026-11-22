@@ -345,6 +345,36 @@ def test_query_image_pair_uses_cache_on_second_call(tmp_path, monkeypatch):
     assert first["result"]["main_title"] == second["result"]["main_title"] == "call-1"
 
 
+def test_query_image_pair_cache_hit_always_uses_current_extra_meta(tmp_path, monkeypatch):
+    """同一張圖先在沒帶 extra_meta 的情況下查過一次（例如手動單獨測試），
+    之後透過 process_events_file 這種有帶 extra_meta 的呼叫再查一次，
+    快取命中也要拿到這次的 extra_meta，不能沿用第一次缺 metadata 的舊紀錄
+    （這是造成 KeyError: 'video_second' 崩潰的根因）。"""
+    full_path = tmp_path / "full.jpg"
+    crop_path = tmp_path / "crop.jpg"
+    _write_test_image(full_path)
+    _write_test_image(crop_path)
+
+    def fake_post(url, json, auth, timeout):
+        return FakeResponse(200, make_valid_body())
+
+    monkeypatch.setattr(vlm.requests, "post", fake_post)
+    monkeypatch.setattr(vlm, "ROOT", tmp_path)
+
+    cache = vlm.ResultCache(tmp_path / "cache.jsonl")
+    env = {"url": "http://fake", "user": "u", "password": "p", "model": "m"}
+
+    without_meta = vlm.query_image_pair(full_path, crop_path, env, cache)  # 手動測試情境：沒帶 extra_meta
+    assert "video_second" not in without_meta
+
+    with_meta = vlm.query_image_pair(
+        full_path, crop_path, env, cache,
+        extra_meta={"channel": "cts", "video_second": 1814, "clock_time": "12:30:14", "minute_code": 1230},
+    )
+    assert with_meta["video_second"] == 1814
+    assert with_meta["channel"] == "cts"
+
+
 def test_format_progress_contains_rate_and_eta():
     text = vlm.format_progress("ftv", done=100, total=400, elapsed_seconds=300)
     assert "ftv" in text

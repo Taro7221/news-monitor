@@ -568,7 +568,15 @@ def query_image_pair(
 
     cached = cache.get(key)
     if cached is not None:
-        return cached
+        # 快取命中只代表「這張圖的 VLM 結果」可以重用；呼叫端這次傳進來的
+        # extra_meta（channel/video_second/clock_time/minute_code...）才是
+        # 這次呼叫真正的上下文，永遠要覆蓋快取裡凍結住的舊 metadata，
+        # 不然同一張圖從不同情境（或沒帶 extra_meta）查過一次後，
+        # 之後所有呼叫都會拿到第一次查詢當下的舊 metadata。
+        record = dict(cached)
+        if extra_meta:
+            record.update(extra_meta)
+        return record
 
     all_attempts: list[dict] = []
     degraded_via: Optional[str] = None
